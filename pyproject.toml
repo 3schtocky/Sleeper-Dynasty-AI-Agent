@@ -1,0 +1,23 @@
+[project]
+name = "dynasty-agent"
+version = "0.1.0"
+description = "Dynasty fantasy football agent for a 12-team Sleeper league"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.5",
+    "httpx>=0.28.1",
+    "pyarrow>=25.0.1",
+]
+
+[project.scripts]
+dynasty-agent = "dynasty_agent:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
