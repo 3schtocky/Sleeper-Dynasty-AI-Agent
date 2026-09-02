@@ -2,6 +2,12 @@
 
 A dynasty fantasy football agent for a single Sleeper league. It evaluates trades in-season, sets weekly lineups, calls contend-or-rebuild, and preps rookie-only drafts. It ships as a CLI tool.
 
+## Status
+
+Phases 0 through 3 are built and verified against live data. Phase 4 (rookie draft prep) has not started, see its open questions below in the Phase plan and the full detail in `PLANNING.md`. `PLANNING.md` is the build log, every methodology decision, real bug found and fixed, and live-verification result lives there; this file stays the reference doc, read `PLANNING.md` for the "why" behind a specific number.
+
+Commands that exist today: `init`, `sync`, `roster`, `ingest-nflverse`, `valuate`, `trade`, `predict-matchup` (draft, not calibrated, see its own status note in `PLANNING.md`), `optimize-lineup`, `faab`, `digest`. `README.md` has usage for each; `WINDOWS.md` has the PowerShell equivalents.
+
 ## Environment
 
 - Developed on a MacBook Air M4, 16GB RAM, macOS. The tool itself is not macOS-only: audited directly for OS-specific assumptions (no subprocess calls, no hardcoded POSIX paths, `pathlib.Path` throughout) and runs identically on Windows, see `WINDOWS.md`.
@@ -43,11 +49,11 @@ calibrated against exactly this format and may need adjusting for yours.
 
 Work in phases. Do not skip ahead. Stop at the end of each phase, show what got built, and wait for approval before continuing.
 
-- **Phase 0, verify and orient.** Confirm league state against the Sleeper API. Report roster, record, and pick inventory in plain language before writing feature code.
-- **Phase 1, data layer only.** Sleeper client (`src/sleeper.py`), nflverse ingestion (`src/nflverse.py`), market values from FantasyCalc (`src/market.py`), and a normalized SQLite schema written as a migration file. No rankings or projections yet. Acceptance test: print the current roster with age, position, team, market value, and 30-day value trend.
-- **Phase 2, analysis layer.** Player valuation (production score, dynasty age curve, situation score, separate win-now and three-year values), contend-or-rebuild verdict with stated confidence, and trade evaluation with pick-value discounting and consolidation flags.
-- **Phase 3, weekly workflow.** Vegas implied totals, opponent strength by EPA allowed, injury and practice-report checks, weather, a win-probability lineup optimizer, FAAB sizing, and a weekly digest command.
-- **Phase 4, rookie draft prep.** A prospect board (draft capital, landing spot, age, college dominator rating, breakout age, athletic testing), pre-draft and post-draft weighting modes, taxi-slot modeling, and pick-value cross-referencing.
+- **Phase 0, verify and orient. Done.** Confirm league state against the Sleeper API. Report roster, record, and pick inventory in plain language before writing feature code.
+- **Phase 1, data layer only. Done.** Sleeper client (`src/sleeper.py`), nflverse ingestion (`src/nflverse.py`), market values from FantasyCalc (`src/market.py`), and a normalized SQLite schema written as a migration file. No rankings or projections yet. Acceptance test: print the current roster with age, position, team, market value, and 30-day value trend.
+- **Phase 2, analysis layer. Done.** Player valuation (production score, dynasty age curve, situation score, separate win-now and three-year values), contend-or-rebuild verdict with stated confidence, and trade evaluation with pick-value discounting and consolidation flags.
+- **Phase 3, weekly workflow. Done.** Vegas implied totals, opponent strength by EPA allowed, injury checks (Sleeper's structured status), weather, a win-probability lineup optimizer, FAAB sizing, and a weekly digest command.
+- **Phase 4, rookie draft prep. Not started.** A prospect board (draft capital, landing spot, age, college dominator rating, breakout age, athletic testing), pre-draft and post-draft weighting modes, taxi-slot modeling, and pick-value cross-referencing. Open questions (prospect data source, pre/post-draft mode switch) not yet confirmed, see `PLANNING.md`.
 
 ## Working rules
 

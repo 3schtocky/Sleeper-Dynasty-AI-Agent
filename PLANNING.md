@@ -1,6 +1,6 @@
 # Phase planning
 
-Working checklist for initiating Phases 2 through 4. Phase 0 and Phase 1 are done and verified, see CLAUDE.md for the summary. Each phase below gets its open questions confirmed before code gets written, the same discipline Phase 1 used for the nflverse release names and the FantasyCalc response shape.
+Working checklist and build log for Phases 2 through 4. Phase 0 and Phase 1 are done and verified; Phases 2 and 3 below are also done. CLAUDE.md has the quick status summary and command list, this file has the full detail behind every number: methodology decisions and why they were made, real bugs found and fixed, and what was actually verified live versus just written. Each phase's open questions get confirmed before code gets written, the same discipline Phase 1 used for the nflverse release names and the FantasyCalc response shape.
 
 ## Phase 2: analysis layer
 
