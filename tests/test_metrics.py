@@ -4,7 +4,10 @@ from dynasty_agent.metrics import (
     age_multiplier,
     compute_fantasy_points,
     discounted_pick_value,
+    injury_adjusted_mean,
     map_snapshot_to_week,
+    matchup_win_probability,
+    normal_cdf,
     percentile_rank,
     production_score,
     situation_multiplier,
@@ -181,6 +184,50 @@ def test_map_snapshot_to_week_finds_the_next_upcoming_week():
 def test_map_snapshot_to_week_is_none_past_the_last_known_week():
     week_starts = [(1, date(2025, 9, 4)), (2, date(2025, 9, 11))]
     assert map_snapshot_to_week(date(2025, 9, 20), week_starts) is None
+
+
+# -- matchup win probability -----------------------------------------------------
+
+
+def test_injury_adjusted_mean_applies_the_right_multiplier():
+    assert injury_adjusted_mean(20.0, "Questionable") == 17.0
+    assert injury_adjusted_mean(20.0, "Out") == 0.0
+    assert injury_adjusted_mean(20.0, None) == 20.0
+    assert injury_adjusted_mean(20.0, "") == 20.0
+
+
+def test_normal_cdf_known_values():
+    assert round(normal_cdf(0.0), 4) == 0.5
+    assert round(normal_cdf(1.959963985), 3) == 0.975  # the familiar 95% one-sided z
+    assert normal_cdf(-5.0) < 0.001
+    assert normal_cdf(5.0) > 0.999
+
+
+def test_matchup_win_probability_favors_the_higher_mean():
+    p = matchup_win_probability(mean_diff=10.0, std_diff=15.0)
+    assert 0.5 < p < 1.0
+
+
+def test_matchup_win_probability_is_half_at_zero_differential():
+    assert matchup_win_probability(mean_diff=0.0, std_diff=15.0) == 0.5
+
+
+def test_matchup_win_probability_symmetric_for_the_other_side():
+    p_a = matchup_win_probability(mean_diff=10.0, std_diff=15.0)
+    p_b = matchup_win_probability(mean_diff=-10.0, std_diff=15.0)
+    assert round(p_a + p_b, 6) == 1.0
+
+
+def test_matchup_win_probability_handles_zero_variance_without_dividing_by_zero():
+    assert matchup_win_probability(mean_diff=5.0, std_diff=0.0) == 1.0
+    assert matchup_win_probability(mean_diff=-5.0, std_diff=0.0) == 0.0
+    assert matchup_win_probability(mean_diff=0.0, std_diff=0.0) == 0.5
+
+
+def test_matchup_win_probability_more_certain_with_lower_variance():
+    tight = matchup_win_probability(mean_diff=10.0, std_diff=5.0)
+    wide = matchup_win_probability(mean_diff=10.0, std_diff=30.0)
+    assert tight > wide  # same edge, less noise, more confident
 
 
 # -- pick discounting -----------------------------------------------------------

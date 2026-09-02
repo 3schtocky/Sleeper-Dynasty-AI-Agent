@@ -66,3 +66,17 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 
 ### Acceptance test
 A ranked prospect board for the next rookie draft, with a recommendation on any picks currently held.
+
+## Out-of-band: ad hoc matchup prediction
+
+Not part of the phase plan, added on request: `dynasty-agent predict-matchup` (`src/dynasty_agent/matchup.py`) estimates win probability between any two arbitrary rosters, not necessarily this league or even a dynasty league. Grew out of manually answering a one-off "who wins this weekend" question by hand.
+
+Explicitly a heuristic, not a fitted model:
+- Each player's mean and variance come from their real weekly `fantasy_points` in a completed nflverse season, that part is real data.
+- The mean gets discounted by current injury status (`metrics.INJURY_MEAN_MULTIPLIER`), round, labeled numbers, not fitted from outcomes.
+- Win probability is the normal CDF of the projected margin over its combined standard deviation, the same idea as Vegas spread-to-moneyline conversion, simplified to two independent team totals.
+- The independence assumption (players' scores don't correlate with their teammates') is real and stated, not hidden. Nothing here has been checked against actual game outcomes, this project has no historical win/loss dataset to check it against.
+
+Verified against a real matchup (7-a-side, PHI/BAL/LAR-heavy roster vs. a WAS/BUF/NYJ-heavy one): 67.8%, in the same neighborhood as, and more defensible than, an earlier off-the-cuff estimate for the same matchup, and the model correctly picked up that the underdog side was carrying four questionable skill players against the favorite's one. 34 tests passing, including edge cases for the normal CDF and zero-variance degenerate case.
+
+Uses this league's own `weekly_stats.fantasy_points` (real for QB/RB/WR/TE, not scored at all for K/DST, this project's nflverse ingestion never covered kicking or defense). A kicker or defense in a matchup comes back flagged "NO DATA," not silently folded in as a zero.

@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import config, market, nflverse, sleeper, valuation
+from dynasty_agent import config, market, matchup, nflverse, sleeper, valuation
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -290,6 +290,44 @@ def cmd_trade(args: argparse.Namespace) -> None:
         print(f"Note: {result['consolidation']}")
 
 
+def cmd_predict_matchup(args: argparse.Namespace) -> None:
+    conn = get_db()
+    if conn.execute("SELECT 1 FROM players LIMIT 1").fetchone() is None:
+        print("No player data yet. Run `dynasty-agent init` and `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+
+    season = args.season or _latest_ingested_season(conn)
+    if season is None:
+        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        result = matchup.predict_matchup(conn, season, args.team_a or [], args.team_b or [])
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(f"Matchup prediction, {season} season basis. This is a heuristic, not a fitted model, see matchup.py.\n")
+
+    def print_side(label: str, side: dict) -> None:
+        print(f"{label}:")
+        for p in side["players"]:
+            flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
+            data_note = "  NO DATA THIS SEASON" if p["games"] == 0 else f"  over {p['games']} games"
+            print(
+                f"  {p['full_name']:<20} {p['position'] or '':<4} {p['team'] or '':<4} "
+                f"{p['adjusted_mean']:>5.1f} avg{flag}{data_note}"
+            )
+        print(f"  Team mean: {side['mean']:.1f}, std dev: {side['variance'] ** 0.5:.1f}\n")
+
+    print_side("Team A", result["team_a"])
+    print_side("Team B", result["team_b"])
+
+    print(f"Projected margin (A - B): {result['mean_diff']:+.1f}, combined std dev: {result['std_diff']:.1f}")
+    print(f"Team A win probability: {result['win_probability_a']:.1%}")
+    print(f"Team B win probability: {result['win_probability_b']:.1%}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="dynasty-agent", description="Dynasty fantasy football agent for a Sleeper league."
@@ -353,6 +391,18 @@ def main() -> None:
         "--season", type=int, default=None, help="Valuation basis season. Defaults to the most recently ingested season."
     )
     trade_parser.set_defaults(func=cmd_trade)
+
+    predict_parser = sub.add_parser(
+        "predict-matchup",
+        help="Estimate win probability between two arbitrary rosters (not necessarily your own league). "
+        "A heuristic built from real season data, not a fitted model, see matchup.py.",
+    )
+    predict_parser.add_argument("--team-a", action="append", metavar="PLAYER", help="A player on team A. Repeatable.")
+    predict_parser.add_argument("--team-b", action="append", metavar="PLAYER", help="A player on team B. Repeatable.")
+    predict_parser.add_argument(
+        "--season", type=int, default=None, help="Defaults to the most recently ingested season."
+    )
+    predict_parser.set_defaults(func=cmd_predict_matchup)
 
     args = parser.parse_args()
     args.func(args)

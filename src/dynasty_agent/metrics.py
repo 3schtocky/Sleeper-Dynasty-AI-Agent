@@ -172,3 +172,55 @@ def map_snapshot_to_week(snapshot_date: date, week_starts: list[tuple[int, date]
     cut snapshot with no more games left to precede."""
     candidate_weeks = [week for week, start in week_starts if start >= snapshot_date]
     return min(candidate_weeks) if candidate_weeks else None
+
+
+# -- ad hoc matchup win probability -------------------------------------------
+#
+# This is a heuristic, not a fitted statistical model. Nothing here was
+# calibrated against real game outcomes, there is no historical win/loss
+# dataset in this project to fit against, and it makes a real, stated
+# simplifying assumption: that players' weekly scores are independent, when
+# in practice teammates correlate somewhat (a QB and his own WR1, for
+# example). What IS real: every mean and variance that feeds it comes from
+# a player's actual weekly fantasy_points in a completed nflverse season,
+# not a guess, and the win-probability step is the same normal-CDF-of-a-
+# point-differential idea Vegas spread-to-moneyline conversion and most NFL
+# win-probability models use, just simplified to two independent team
+# totals instead of a play-by-play model.
+
+# Rough, round, and labeled as such: how much of a player's normal expected
+# production to still count given their current injury designation. Not
+# fitted from outcome data, there's no such dataset here, these are
+# deliberately conservative, common-sense fractions, easy to override.
+INJURY_MEAN_MULTIPLIER: dict[str, float] = {
+    "Out": 0.0,
+    "IR": 0.0,
+    "Suspended": 0.0,
+    "Doubtful": 0.25,
+    "Questionable": 0.85,
+}
+
+
+def injury_adjusted_mean(raw_mean: float, injury_status: str | None) -> float:
+    return raw_mean * INJURY_MEAN_MULTIPLIER.get(injury_status or "", 1.0)
+
+
+def normal_cdf(z: float) -> float:
+    """Standard normal cumulative distribution function, via math.erf so
+    this has no dependency on scipy or numpy."""
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+def matchup_win_probability(mean_diff: float, std_diff: float) -> float:
+    """P(team A's score exceeds team B's), given the mean and standard
+    deviation of the (team A - team B) differential, modeled as normal.
+    std_diff of 0 is a degenerate case (every player scored the exact same
+    number every week, or an empty roster): returns 1.0/0.0/0.5 by the sign
+    of mean_diff instead of dividing by zero."""
+    if std_diff <= 0:
+        if mean_diff > 0:
+            return 1.0
+        if mean_diff < 0:
+            return 0.0
+        return 0.5
+    return normal_cdf(mean_diff / std_diff)
