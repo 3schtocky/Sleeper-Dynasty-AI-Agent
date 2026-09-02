@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import config, market, matchup, nflverse, sleeper, valuation
+from dynasty_agent import config, market, matchup, nflverse, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -293,6 +293,26 @@ def cmd_trade(args: argparse.Namespace) -> None:
         print(f"Note: {result['consolidation']}")
 
 
+def _resolve_vegas_season(conn, explicit_vegas_season: int | None) -> int:
+    """The season --week's Vegas lines belong to. The real current NFL
+    season from the last sync when not given explicitly, never inferred
+    from the FPPG baseline season: week 1 of a completed season already
+    has real closing lines from last year's game, so any presence-based
+    fallback silently prices the wrong year. See matchup.predict_matchup's
+    docstring for the bug this replaced."""
+    if explicit_vegas_season is not None:
+        return explicit_vegas_season
+    state_row = conn.execute("SELECT season FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    if state_row is None:
+        print(
+            "No synced NFL state to determine the current season. Run `dynasty-agent sync` first, "
+            "or pass --vegas-season explicitly.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    return int(state_row["season"])
+
+
 def cmd_predict_matchup(args: argparse.Namespace) -> None:
     conn = get_db()
     if conn.execute("SELECT 1 FROM players LIMIT 1").fetchone() is None:
@@ -304,23 +324,7 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
         print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
         raise SystemExit(1)
 
-    if args.vegas_season is not None:
-        vegas_season = args.vegas_season
-    else:
-        # The real current NFL season from the last `sync`, not a guess.
-        # Do not infer this from `season` (the FPPG baseline season): week 1
-        # of a completed season already has real closing lines from last
-        # year's game, so any presence-based fallback silently prices the
-        # wrong year. See matchup.predict_matchup's docstring.
-        state_row = conn.execute("SELECT season FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
-        if state_row is None:
-            print(
-                "No synced NFL state to determine the current season. Run `dynasty-agent sync` first, "
-                "or pass --vegas-season explicitly.",
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
-        vegas_season = int(state_row["season"])
+    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
 
     try:
         result = matchup.predict_matchup(conn, season, vegas_season, args.week, args.team_a or [], args.team_b or [])
@@ -362,6 +366,157 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
     print(f"Projected margin (A - B): {result['mean_diff']:+.1f}, combined std dev: {result['std_diff']:.1f}")
     print(f"Team A win probability: {result['win_probability_a']:.1%}")
     print(f"Team B win probability: {result['win_probability_b']:.1%}")
+
+
+def cmd_optimize_lineup(args: argparse.Namespace) -> None:
+    _require_config()
+    conn = get_db()
+    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
+    if roster is None:
+        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+
+    stats_season = args.season or _latest_ingested_season(conn)
+    if stats_season is None:
+        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
+        raise SystemExit(1)
+    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+
+    with SleeperClient(conn) as client:
+        client.sync_matchups(args.week)
+
+    try:
+        result = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, roster["roster_id"])
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if result["unsupported_slots"]:
+        print(
+            f"Warning: this league's roster has starting slot types this optimizer doesn't handle yet: "
+            f"{result['unsupported_slots']}. Those slots were left unfilled.\n"
+        )
+
+    print(f"Lineup optimizer, {stats_season} season FPPG basis, week {args.week} of the {vegas_season} season.")
+    print("Picks by win probability against your real Sleeper opponent, not raw projected points.\n")
+
+    if result["opponent_note"]:
+        print(f"Opponent: {result['opponent_note']}\n")
+    else:
+        print(
+            f"Opponent (roster {result['opponent_roster_id']}): projected "
+            f"{result['opponent_mean']:.1f} ± {result['opponent_variance'] ** 0.5:.1f}\n"
+        )
+
+    print("Recommended lineup:")
+    for p in result["recommended_lineup"]:
+        flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
+        vegas_note = f", vegas x{p['vegas_multiplier']:.2f}" if p["vegas_multiplier"] != 1.0 else ""
+        bye_note = "  BYE WEEK" if p["on_bye"] else ""
+        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f} var={p['variance']:>5.1f}{vegas_note}{flag}{bye_note}")
+
+    if result["recommended_win_probability"] is not None:
+        print(f"\nWin probability: {result['recommended_win_probability']:.1%}")
+    else:
+        print("\nWin probability: n/a, could not assemble a full valid lineup, check unsupported_slots above")
+
+    if result["differs_from_points_max"]:
+        print(
+            f"\nNote: this differs from the highest-raw-points lineup ({result['points_max_total']:.1f} pts). "
+            f"The flex slot is doing real work here, trading a little mean for a better win probability "
+            f"given this specific matchup, not just stacking points."
+        )
+
+    print("\nBench:")
+    for p in sorted(result["bench"], key=lambda p: -p["mean"]):
+        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}")
+
+
+def cmd_faab(args: argparse.Namespace) -> None:
+    _require_config()
+    conn = get_db()
+    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
+    if roster is None:
+        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+
+    stats_season = args.season or _latest_ingested_season(conn)
+    if stats_season is None:
+        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        result = weekly.faab_recommendation(conn, stats_season, roster["roster_id"], args.player)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(f"FAAB recommendation for {result['player']} ({result['position']})")
+    if result["is_rostered"]:
+        print("Warning: this player is already on a roster in your league, not actually a free agent right now.")
+    print(f"\nRemaining budget: ${result['remaining_budget']}, {result['weeks_left']} weeks left before the playoffs.")
+    print(
+        f"Win-now value: {result['target_win_now_value']:.1f} "
+        f"({result['percentile_among_available']:.0f}th percentile among players actually available on waivers, "
+        f"not everyone in the league)."
+    )
+    print(
+        f"Base pace, remaining budget split evenly across the weeks left: ${result['base_per_week_budget']:.2f}/week, "
+        f"scaled ×{result['value_multiplier']:.2f} for this target's value."
+    )
+    print(f"\nSuggested bid: ${result['suggested_bid']}")
+
+
+def cmd_digest(args: argparse.Namespace) -> None:
+    _require_config()
+    conn = get_db()
+    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
+    if roster is None:
+        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+
+    stats_season = args.season or _latest_ingested_season(conn)
+    if stats_season is None:
+        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
+        raise SystemExit(1)
+    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+
+    with SleeperClient(conn) as client:
+        client.sync_matchups(args.week)
+
+    print(f"=== Week {args.week} digest, {stats_season} season FPPG basis, {vegas_season} season Vegas lines ===\n")
+
+    try:
+        lineup = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, roster["roster_id"])
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print("Start:")
+    for p in lineup["recommended_lineup"]:
+        flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
+        wind_note = ""
+        if p["team"] and not p["on_bye"]:
+            w = weather.game_wind_forecast(vegas_season, args.week, p["team"])
+            if w["status"] == "ok" and w["flag"]:
+                wind_note = f"  WIND {w['wind_mph']:.0f} mph at {w['stadium']}"
+        bye_note = "  BYE WEEK" if p["on_bye"] else ""
+        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}{flag}{wind_note}{bye_note}")
+
+    if lineup["recommended_win_probability"] is not None:
+        print(f"\nWin probability: {lineup['recommended_win_probability']:.1%}")
+    if lineup["differs_from_points_max"]:
+        print("Chosen over the pure-points lineup for a better win probability against this week's specific opponent.")
+
+    print("\nSit (top bench by projection):")
+    for p in sorted(lineup["bench"], key=lambda p: -p["mean"])[:5]:
+        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}")
+
+    print("\nFAAB targets (highest win-now value actually available on waivers right now):")
+    for bid in weekly.top_faab_targets(conn, stats_season, roster["roster_id"]):
+        print(f"  {bid['player']:<20} {bid['position']:<3} value={bid['target_win_now_value']:>5.1f}  suggested bid ${bid['suggested_bid']}")
+
+    print("\nThis is DRAFT-heuristic math throughout (see matchup.py, PLANNING.md), not a calibrated prediction.")
 
 
 def main() -> None:
@@ -447,6 +602,43 @@ def main() -> None:
         help="Season --week's Vegas lines belong to. Defaults to the real current NFL season from the last sync.",
     )
     predict_parser.set_defaults(func=cmd_predict_matchup)
+
+    optimize_parser = sub.add_parser(
+        "optimize-lineup",
+        help="The starting lineup that maximizes win probability against your real Sleeper opponent this week, "
+        "not raw projected points.",
+    )
+    optimize_parser.add_argument("--week", type=int, required=True)
+    optimize_parser.add_argument(
+        "--season", type=int, default=None, help="FPPG/variance baseline season. Defaults to the most recently ingested season."
+    )
+    optimize_parser.add_argument(
+        "--vegas-season", type=int, default=None,
+        help="Season --week's Vegas lines belong to. Defaults to the real current NFL season from the last sync.",
+    )
+    optimize_parser.set_defaults(func=cmd_optimize_lineup)
+
+    faab_parser = sub.add_parser(
+        "faab", help="A sized FAAB bid for one waiver target, against your real remaining budget and weeks left."
+    )
+    faab_parser.add_argument("--player", required=True, metavar="PLAYER", help="Player name or Sleeper player_id.")
+    faab_parser.add_argument(
+        "--season", type=int, default=None, help="Valuation basis season. Defaults to the most recently ingested season."
+    )
+    faab_parser.set_defaults(func=cmd_faab)
+
+    digest_parser = sub.add_parser(
+        "digest", help="The weekly brief: recommended lineup, win probability, wind flags, and top bench options."
+    )
+    digest_parser.add_argument("--week", type=int, required=True)
+    digest_parser.add_argument(
+        "--season", type=int, default=None, help="FPPG/variance baseline season. Defaults to the most recently ingested season."
+    )
+    digest_parser.add_argument(
+        "--vegas-season", type=int, default=None,
+        help="Season --week's Vegas lines belong to. Defaults to the real current NFL season from the last sync.",
+    )
+    digest_parser.set_defaults(func=cmd_digest)
 
     args = parser.parse_args()
     args.func(args)

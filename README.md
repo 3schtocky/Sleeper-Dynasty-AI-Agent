@@ -14,8 +14,11 @@ It is built for **one specific league shape**: 12 teams, 1QB, full PPR, no TE pr
 - **`valuate`** — win-now value and three-year value per player (kept separate, never blended into one number), plus a contend-or-rebuild verdict with its confidence stated, not implied.
 - **`trade`** — evaluates a proposed trade: both sides on win-now and three-year value, future picks discounted by a tunable rate and checked against FantasyCalc for arbitrage, and consolidation opportunities flagged.
 - **`predict-matchup`** *(draft)* — win probability between any two rosters, not necessarily your own league or even a dynasty league. A first-draft heuristic, not a fitted model, on the way to a proper prediction mode with a trade bot built on top of it. See "How the numbers work" below for exactly what that means.
+- **`optimize-lineup`** — the starting lineup, out of your real roster, that maximizes win probability against your actual Sleeper opponent for a given week, not raw projected points. Reports the highest-raw-points lineup alongside for comparison, since they can differ.
+- **`faab`** — a sized FAAB bid for one waiver target, against your real remaining budget, real weeks left before the playoffs, and how that target's real win-now value compares to everyone else actually available right now.
+- **`digest`** — the weekly brief: recommended lineup and win probability, real wind flags for your starters' games, top bench options, and sized suggestions for the best available waiver targets, all in one command.
 
-What it doesn't do yet: weekly lineup optimization for your own team, Vegas/weather-aware start-sit advice, waiver FAAB sizing, and rookie draft prep. See `PLANNING.md` for where those stand.
+What it doesn't do yet: rookie draft prep. See `PLANNING.md` for where that stands.
 
 ## Requirements
 
@@ -79,6 +82,26 @@ uv run dynasty-agent predict-matchup --week 1 \
 
 `--week` is required, it picks up real Vegas lines for that week from nflverse's own free schedules data (no paid odds API, no API key). The FPPG baseline season and the Vegas season are two different numbers on purpose, `--season` defaults to the most recently completed season (there's usually no current-season data yet) while `--vegas-season` defaults to whatever season is actually live right now, per your last `sync`. Override either if you're checking a specific past week.
 
+Optimize your own lineup for a real week, against your real Sleeper opponent:
+
+```
+uv run dynasty-agent optimize-lineup --week 1
+```
+
+Size a FAAB bid on a specific waiver target:
+
+```
+uv run dynasty-agent faab --player "Marquise Brown"
+```
+
+Or just run the whole week in one shot, lineup, win probability, wind flags, and sized FAAB targets:
+
+```
+uv run dynasty-agent digest --week 1
+```
+
+`digest` makes real live network calls per recommended starter (checking wind for their specific game), so it's the slowest command here, correctness kept over shaving that down.
+
 Every command reruns fresh against whatever's cached in `data/` (git-ignored, local SQLite plus downloaded nflverse parquet files). Nothing here needs a server or an account beyond your own Sleeper login.
 
 ## How the numbers work, briefly
@@ -89,7 +112,12 @@ Every command reruns fresh against whatever's cached in `data/` (git-ignored, lo
 - **Pick values**: anchored to FantasyCalc's real current price for a `<round>` pick, discounted forward per year by `--discount-rate` (default 20%/year).
 - **Matchup win probability** (`predict-matchup`) takes each side's players' real per-season mean and *sample* variance of weekly fantasy points (Bessel's correction, dividing by n-1, an earlier draft divided by n and understated it), scales the mean by a real Vegas-implied team total for the specific week versus that team's own season norm (nflverse's free schedules data, `spread_line`/`total_line`, no paid odds API), widens or collapses variance by current injury status (Questionable/Doubtful is closer to bimodal than a healthy player's normal week-to-week swing, so it widens; Out/IR collapses toward near-certain zero), and reads the win probability off the normal distribution of the resulting margin, the same idea Vegas spread-to-moneyline conversion uses. Read this one as a **draft heuristic, not a fitted model**: nothing here is calibrated against real game outcomes, and it assumes players score independently of their teammates, which isn't quite true (a QB and his own WR1 correlate). It's grounded in real per-player, per-week data at every step, it's just not a validated prediction, and it's a first draft toward a real prediction mode with a trade bot on top, not that thing itself.
 
-Every one of these is a plain, readable function in `src/dynasty_agent/metrics.py`, unit tested in `tests/test_metrics.py`, not a black box.
+- **Lineup optimizer** (`optimize-lineup`, `digest`) evaluates every valid lineup your real roster supports (respecting this league's own `roster_positions`, never hardcoded) and picks the one with the highest computed win probability against your real Sleeper opponent for that week, not the highest raw point total. They usually agree; when they don't, that's the flex slot earning its keep, trading a little mean for a lower-variance (or higher-ceiling, if you're the underdog) option.
+- **Opponent strength by position** is real EPA per play allowed by a defense, split by the offensive position that gained it (a QB's own scrambles count under QB, not RB), never raw fantasy points allowed, which is schedule-biased and noisy.
+- **Weather** checks the real forecast (the National Weather Service's public API, free, no key) for a game's actual venue, not an assumed home stadium, international games are read from the real schedule data and either covered or explicitly flagged as not, never guessed. Domes and closed-roof games skip the check entirely, no network call.
+- **FAAB sizing** (`faab`, `digest`) scales your real remaining budget by real weeks left before the playoffs and by how the target's real win-now value compares to everyone actually available on waivers right now, not a guess at their name value.
+
+Every one of these is a plain, readable function in `src/dynasty_agent/metrics.py` (or `weekly.py`/`weather.py` for the Phase 3 additions), unit tested where the logic is pure, verified live against real data everywhere else, not a black box.
 
 ## Project layout
 

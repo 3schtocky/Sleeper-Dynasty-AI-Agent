@@ -359,6 +359,37 @@ class SleeperClient:
         self.conn.commit()
         return picks
 
+    def sync_matchups(self, week: int) -> list[dict]:
+        """Every roster's matchup_id, current starters, and points for one
+        week. matchup_id pairs two rosters together, the actual weekly
+        opponent, which the lineup optimizer needs and Phase 1 never
+        populated (the table existed in the schema, unused, until now)."""
+        matchups = self.get_matchups(week)
+        fetched_at = utcnow()
+        self.conn.execute("DELETE FROM matchups WHERE league_id = ? AND week = ?", (self.league_id, week))
+        rows = [
+            (
+                self.league_id,
+                week,
+                m["roster_id"],
+                m.get("matchup_id"),
+                m.get("points"),
+                json.dumps(m.get("starters") or []),
+                json.dumps(m.get("players") or []),
+                fetched_at,
+            )
+            for m in matchups
+        ]
+        self.conn.executemany(
+            """
+            INSERT INTO matchups (league_id, week, roster_id, matchup_id, points, starters_json, players_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.conn.commit()
+        return matchups
+
     def sync_nfl_state(self) -> dict:
         state = self.get_nfl_state()
         fetched_at = utcnow()

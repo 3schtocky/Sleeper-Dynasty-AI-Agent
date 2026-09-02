@@ -36,22 +36,28 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 
 **Constraint, stated by request, not just by prior habit: quantitative first.** Every input here should resolve to a real, sourced number wherever one exists, not a qualitative override layered on top of the math. Concretely: Vegas implied team totals and spreads come from real market data, not a gut adjustment. Opponent strength is EPA allowed per play (already derivable from Phase 1's play-by-play ingestion), never raw fantasy points allowed, which is schedule-biased and noisy. The lineup optimizer picks by computed win probability against that week's specific opponent, not raw projected points. Injury and weather feed in as structured multipliers on the underlying math (the same pattern `metrics.injury_adjusted_mean`/`injury_adjusted_variance` already use in the matchup-prediction draft), not as narrative color. Sentiment-only sources (beat writer chatter, Reddit) stay exactly what CLAUDE.md's working rules already call them, signal, not fact, and never substitute for a real underlying stat.
 
-### Open questions to confirm first
-- [x] Odds API. Resolved for free: nflverse's own schedules file (`spread_line`/`total_line`/moneylines`, no key, no paid provider) is already wired up and tested in `matchup.py` (`team_week_implied_points`, `team_season_avg_implied_points`). Reuse that, don't source a second provider.
-- [ ] Injury and practice-report source. Spec calls for web search against official reports and beat writers, checked Wednesday, Friday, and Sunday morning. Needs confirmation on whether this runs on demand or on a schedule. Given the quantitative-first constraint above, the structured Sleeper `injury_status` field (already live, already the exact signal the matchup-prediction draft uses) is the primary quantitative input; web-searched practice-report color, if built at all, is a secondary, explicitly-labeled overlay, not a replacement for it.
-- [ ] Weather source, not yet chosen, needed for the 15 mph wind flag. `api.weather.gov` (NWS, US government, free, no key) confirmed live and reachable, matches this project's no-auth-provider pattern (Sleeper, FantasyCalc, nflverse). Needs a stadium lat/lon lookup table (genuinely non-derivable, not in any existing data source) and explicit dome/retractable-roof handling, wind doesn't apply indoors.
+### Open questions, confirmed
+- [x] Odds API. Resolved for free: nflverse's own schedules file (`spread_line`/`total_line`/moneylines, no key, no paid provider) is already wired up and tested in `matchup.py` (`team_week_implied_points`, `team_season_avg_implied_points`). Reused directly, not a second provider.
+- [x] Injury and practice-report source: Sleeper's structured `injury_status` only, by request. No web-search layer built. Already the exact signal `matchup.py` uses, now reused a third time in `weekly.project_player`.
+- [x] Weather source: `api.weather.gov` (pulled programmatically, per direct request), confirmed live. Real technical detail resolved during the build, not just flagged: no static team-to-stadium table works, `games.parquet`'s own `stadium`/`roof`/`stadium_id` columns are read per game (international games, e.g. a real 2026 Week 1 game's home "LA" mapping to Melbourne Cricket Ground, break any team-keyed assumption). `weather.STADIUM_COORDINATES` covers the 30 current domestic venues, keyed by `stadium_id`, not team name (survives sponsor renames). An international game's venue isn't in it and comes back explicitly "not covered." NWS forecasts only reach about a week out; a game further off comes back "not forecasted yet," never a guessed number.
 
 ### Build order
-1. [ ] Vegas implied team totals and spreads, once a provider is confirmed.
-2. [ ] Opponent strength by position from EPA allowed per play, derivable from Phase 1's play-by-play ingestion, not raw fantasy points allowed.
-3. [ ] Injury and practice participation checks.
-4. [ ] Weather, flagging wind above 15 mph.
-5. [ ] Lineup optimizer maximizing win probability against that week's specific opponent, not raw projected points.
-6. [ ] FAAB bid sizing against remaining budget and weeks left.
-7. [ ] Weekly digest command tying all of the above into one readable brief.
+1. [x] Vegas implied team totals and spreads: `weekly.team_vegas_context`, thin wrapper reusing `matchup.py`'s existing functions.
+2. [x] Opponent strength by position from real EPA allowed per play: `weekly.opponent_strength_by_position`, play-by-play joined to the weekly roster crosswalk for position (a QB's own scrambles count under QB, not RB), percentile-ranked against the other 31 defenses per position. All 32 teams covered on a live run.
+3. [x] Injury checks: Sleeper's `injury_status`, already flowing through `weekly.project_player` the same way `matchup.py` uses it.
+4. [x] Weather: `weather.game_wind_forecast`, real per-game venue and roof status, real NWS forecast wind, 15 mph flag. Dome/closed-roof games short-circuit with no network call.
+5. [x] Lineup optimizer: `weekly.optimize_lineup`, `dynasty-agent optimize-lineup`. Brute-force search (a few thousand valid lineups at most for this league's roster size, proven fast enough live, ~2s) over every combination respecting the league's own real `roster_positions` (never hardcoded), picking by `matchup_win_probability` against the real Sleeper opponent for that week (via a newly-added `sleeper.sync_matchups`, closing a gap where Phase 1 defined the `matchups` table but never populated it), not raw points. Reports the highest-raw-points lineup alongside for comparison.
+6. [x] FAAB bid sizing: `weekly.faab_recommendation`, `dynasty-agent faab --player <name>`. Sized against real remaining budget (`rosters.waiver_budget_used`) and real weeks left before the playoffs (`playoff_week_start` minus the real current week), scaled by the target's real win-now value percentile among players actually unrostered right now, not a guess at name value. `FAAB_MIN/MAX_VALUE_MULTIPLIER` are round labeled constants, not fitted, same honesty standard as the injury multipliers.
+7. [x] Weekly digest: `dynasty-agent digest --week <N>`. Ties 1-6 together: recommended lineup with win probability, wind flags on real per-player teams, top bench options, and real sized FAAB suggestions for the highest-value actually-available free agents (not just a pointer to run `faab` separately, the acceptance test asks for suggestions, so it gives them).
+
+### Verified live, not just written
+- `optimize_lineup` against the real Week 1 2026 roster and real Sleeper matchup: solved in ~2s, correctly benched Lamar Jackson for Matthew Stafford, a real, surprising-sounding but honest result, Stafford's actual 2025 FPPG (21.1) beat Lamar's (17.1) in the only season this project has data for. No dynasty reputation or situation score in this call, on purpose, a weekly start/sit decision isn't a dynasty-value decision.
+- `faab_recommendation` tested against a rostered player (correctly flagged `is_rostered`, not silently priced as available) and a real, genuinely unrostered free agent (Marquise Brown, 98.8th percentile among what's actually available, $21 suggested out of $100 with 14 weeks left).
+- `digest` end to end: ~21s (mostly real network time: live NWS forecast calls per recommended starter, correctness kept over shaving that down). A real inefficiency was caught and fixed during the build: `top_faab_targets` was recomputing `player_valuations` (non-trivial, runs `team_situation_scores` under the hood) once per candidate instead of once total, cut the digest's runtime roughly in half.
+- 55 tests passing (6 new: `parse_wind_mph`'s range/single-value/unparseable cases, `_starting_slot_counts` against this league's real shape and a different one, proving it isn't hardcoded).
 
 ### Acceptance test
-`dynasty-agent digest` for a real week, producing a lineup recommendation and FAAB suggestions with inputs shown.
+`dynasty-agent digest` for a real week, producing a lineup recommendation and FAAB suggestions with inputs shown. Ran clean against real Week 1 2026 data.
 
 ## Phase 4: rookie draft prep
 
