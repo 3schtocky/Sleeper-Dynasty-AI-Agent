@@ -307,7 +307,10 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
-    print(f"Matchup prediction, {season} season basis. This is a heuristic, not a fitted model, see matchup.py.\n")
+    print(
+        f"Matchup prediction, {season} season basis. DRAFT MODEL, a heuristic, not a fitted or calibrated "
+        f"prediction, see matchup.py and PLANNING.md.\n"
+    )
 
     def print_side(label: str, side: dict) -> None:
         print(f"{label}:")
@@ -394,8 +397,8 @@ def main() -> None:
 
     predict_parser = sub.add_parser(
         "predict-matchup",
-        help="Estimate win probability between two arbitrary rosters (not necessarily your own league). "
-        "A heuristic built from real season data, not a fitted model, see matchup.py.",
+        help="[DRAFT] Estimate win probability between two arbitrary rosters (not necessarily your own "
+        "league). A heuristic built from real season data, not a fitted or calibrated model, see matchup.py.",
     )
     predict_parser.add_argument("--team-a", action="append", metavar="PLAYER", help="A player on team A. Repeatable.")
     predict_parser.add_argument("--team-b", action="append", metavar="PLAYER", help="A player on team B. Repeatable.")

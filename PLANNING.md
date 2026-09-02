@@ -67,9 +67,13 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 ### Acceptance test
 A ranked prospect board for the next rookie draft, with a recommendation on any picks currently held.
 
-## Out-of-band: ad hoc matchup prediction
+## Out-of-band: ad hoc matchup prediction — DRAFT
 
 Not part of the phase plan, added on request: `dynasty-agent predict-matchup` (`src/dynasty_agent/matchup.py`) estimates win probability between any two arbitrary rosters, not necessarily this league or even a dynasty league. Grew out of manually answering a one-off "who wins this weekend" question by hand.
+
+**Status: draft, explicitly.** This is the first pass, not the finished thing. Marked as such in the module docstring, the CLI help text, the CLI's own output every time it runs, and the README, on purpose, so "draft" stays visible wherever someone actually runs into it, not just here.
+
+**Planned next**, once there's a real dataset to build against: a proper prediction mode, calibrated against actual game outcomes rather than the current uncalibrated normal-CDF heuristic, and a trade bot built on top of that prediction mode, presumably using it to source or evaluate trade targets automatically rather than requiring a manually specified `dynasty-agent trade` call. Neither is scoped yet, no open questions or build order below, that comes when work on it actually starts.
 
 Explicitly a heuristic, not a fitted model:
 - Each player's mean and variance come from their real weekly `fantasy_points` in a completed nflverse season, that part is real data.

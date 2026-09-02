@@ -1,6 +1,11 @@
-"""Ad hoc win probability between two arbitrary rosters, not necessarily
-your own league. This generalizes a one-off "who wins this weekend" lookup
-into real, reusable code.
+"""DRAFT MODEL. Ad hoc win probability between two arbitrary rosters, not
+necessarily your own league. This generalizes a one-off "who wins this
+weekend" lookup into real, reusable code, however it is a first draft, not
+a finished prediction engine. The intended next step is a proper
+prediction mode (calibrated against real outcomes, this project has none
+yet) with a trade bot built on top of it; this module is what that gets
+built from, not the finished thing. See PLANNING.md's "Out-of-band" section
+for the current status.
 
 Read this as a heuristic, not a calibrated prediction: it has never been
 checked against real outcomes, this project has no historical win/loss
