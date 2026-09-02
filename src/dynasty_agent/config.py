@@ -38,12 +38,6 @@ FANTASYCALC_PARAMS = {
     "ppr": os.environ.get("FANTASYCALC_PPR", "1"),
 }
 
-# Phase 4 (rookie draft prep) only: a free key from collegefootballdata.com,
-# used to compute real college production stats for the prospect board.
-# None until the user registers one and adds it to .env; not in
-# missing_config() below since nothing else in this project needs it.
-CFBD_API_KEY = os.environ.get("CFBD_API_KEY")
-
 
 def missing_config() -> list[str]:
     """Which required .env variables are unset, empty list if none. Used to
