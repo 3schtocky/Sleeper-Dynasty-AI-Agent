@@ -50,11 +50,14 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"\nRe-run with --league-id <id> to pick one.")
         raise SystemExit(1)
 
+    # encoding explicit: Path.write_text() otherwise falls back to the OS
+    # locale encoding, not always UTF-8 on Windows.
     config.ENV_PATH.write_text(
         f"SLEEPER_USERNAME={args.username}\n"
         f"SLEEPER_USER_ID={user_id}\n"
         f"LEAGUE_ID={league['league_id']}\n"
-        f"DRAFT_ID={league.get('draft_id') or ''}\n"
+        f"DRAFT_ID={league.get('draft_id') or ''}\n",
+        encoding="utf-8",
     )
     print(f"Wrote {config.ENV_PATH}")
     print(f"League: {league['name']} ({league['league_id']}, {current_season} season)")

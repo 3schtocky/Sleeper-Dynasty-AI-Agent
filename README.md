@@ -4,6 +4,8 @@ A CLI tool that manages a dynasty fantasy football team on [Sleeper](https://sle
 
 It is built for **one specific league shape**: 12 teams, 1QB, full PPR, no TE premium, a 3-round rookie-only startup/rookie draft. It will run against a differently-shaped Sleeper dynasty league, since your real league settings and scoring get pulled live, however some of the tuning (the age curve, the QB-discount and WR-bump multipliers, the situation score weights) was calibrated for that shape specifically. Read `CLAUDE.md` for the full reasoning behind those numbers before trusting them blindly in, say, a superflex or half-PPR league.
 
+**On Windows?** Everything below works identically, same Python, same `uv`, same commands, checked directly rather than assumed. See [`WINDOWS.md`](WINDOWS.md) for PowerShell-specific install steps and command syntax (line continuation is a backtick, not a backslash) instead of translating the Bash examples below yourself.
+
 ## What it does today
 
 - **`sync`** — pulls your league, all rosters, users, traded picks, current NFL week, and FantasyCalc dynasty values.
@@ -97,6 +99,7 @@ migrations/          the SQLite schema, one file per migration, applied automati
 tests/                unit tests for the metric calculations
 CLAUDE.md             environment, league settings, strategic reasoning, and working rules
 PLANNING.md           phase-by-phase build status and open questions
+WINDOWS.md            Windows-specific install steps and command syntax
 ```
 
 ## License

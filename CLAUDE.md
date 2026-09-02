@@ -4,7 +4,7 @@ A dynasty fantasy football agent for a single Sleeper league. It evaluates trade
 
 ## Environment
 
-- MacBook Air M4, 16GB RAM, macOS.
+- Developed on a MacBook Air M4, 16GB RAM, macOS. The tool itself is not macOS-only: audited directly for OS-specific assumptions (no subprocess calls, no hardcoded POSIX paths, `pathlib.Path` throughout) and runs identically on Windows, see `WINDOWS.md`.
 - Python 3.12, managed with `uv`. Run everything through `uv run`, add dependencies with `uv add`.
 - SQLite for persistent storage. DuckDB for analytical queries over play-by-play data.
 - No GPU work and no local models. Every model call hits an API.

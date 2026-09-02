@@ -42,7 +42,9 @@ def apply_migrations(conn: sqlite3.Connection, migrations_dir: Path = MIGRATIONS
         version = path.stem
         if version in applied:
             continue
-        conn.executescript(path.read_text())
+        # encoding explicit: Path.read_text() otherwise falls back to the
+        # OS locale encoding, not always UTF-8 on Windows.
+        conn.executescript(path.read_text(encoding="utf-8"))
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (version, utcnow()),

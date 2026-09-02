@@ -18,3 +18,9 @@ data/
 
 # Secrets
 .env
+
+# OS junk files
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
