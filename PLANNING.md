@@ -34,10 +34,12 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 
 ## Phase 3: weekly workflow
 
+**Constraint, stated by request, not just by prior habit: quantitative first.** Every input here should resolve to a real, sourced number wherever one exists, not a qualitative override layered on top of the math. Concretely: Vegas implied team totals and spreads come from real market data, not a gut adjustment. Opponent strength is EPA allowed per play (already derivable from Phase 1's play-by-play ingestion), never raw fantasy points allowed, which is schedule-biased and noisy. The lineup optimizer picks by computed win probability against that week's specific opponent, not raw projected points. Injury and weather feed in as structured multipliers on the underlying math (the same pattern `metrics.injury_adjusted_mean`/`injury_adjusted_variance` already use in the matchup-prediction draft), not as narrative color. Sentiment-only sources (beat writer chatter, Reddit) stay exactly what CLAUDE.md's working rules already call them, signal, not fact, and never substitute for a real underlying stat.
+
 ### Open questions to confirm first
-- [ ] Odds API. CLAUDE.md's own Phase 3 spec says ask before wiring one up. No provider chosen yet.
-- [ ] Injury and practice-report source. Spec calls for web search against official reports and beat writers, checked Wednesday, Friday, and Sunday morning. Needs confirmation on whether this runs on demand or on a schedule.
-- [ ] Weather source, not yet chosen, needed for the 15 mph wind flag.
+- [x] Odds API. Resolved for free: nflverse's own schedules file (`spread_line`/`total_line`/moneylines`, no key, no paid provider) is already wired up and tested in `matchup.py` (`team_week_implied_points`, `team_season_avg_implied_points`). Reuse that, don't source a second provider.
+- [ ] Injury and practice-report source. Spec calls for web search against official reports and beat writers, checked Wednesday, Friday, and Sunday morning. Needs confirmation on whether this runs on demand or on a schedule. Given the quantitative-first constraint above, the structured Sleeper `injury_status` field (already live, already the exact signal the matchup-prediction draft uses) is the primary quantitative input; web-searched practice-report color, if built at all, is a secondary, explicitly-labeled overlay, not a replacement for it.
+- [ ] Weather source, not yet chosen, needed for the 15 mph wind flag. `api.weather.gov` (NWS, US government, free, no key) confirmed live and reachable, matches this project's no-auth-provider pattern (Sleeper, FantasyCalc, nflverse). Needs a stadium lat/lon lookup table (genuinely non-derivable, not in any existing data source) and explicit dome/retractable-roof handling, wind doesn't apply indoors.
 
 ### Build order
 1. [ ] Vegas implied team totals and spreads, once a provider is confirmed.
@@ -52,6 +54,8 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 `dynasty-agent digest` for a real week, producing a lineup recommendation and FAAB suggestions with inputs shown.
 
 ## Phase 4: rookie draft prep
+
+**Same constraint as Phase 3: quantitative first.** The prospect board ranks on quantifiable inputs, draft capital, college production metrics (dominator rating), breakout age, athletic testing, with stated weights per position matching this league's actual scoring, not subjective scouting takes. Where a number can be sourced and computed, it gets computed; sentiment-only inputs stay explicitly labeled as such and never substitute for a real underlying stat, the same standard Phase 2 already set with win-now/three-year value and the trade evaluator's arbitrage math.
 
 ### Open questions to confirm first
 - [ ] Prospect data source. Draft capital, landing spot, college dominator rating, breakout age, and athletic testing are not in nflverse's player-week files. Needs a source before the prospect board can be built.
