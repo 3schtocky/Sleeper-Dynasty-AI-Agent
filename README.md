@@ -67,13 +67,15 @@ uv run dynasty-agent trade \
 
 `trade` reports three numbers per side, deliberately never summed together: **win-now** and **three-year** (this league's own formula, players only, a pick can't help you win this year so it doesn't appear there), and **market value** (FantasyCalc's real pricing for players plus a discount-adjusted model value for picks, the one number that's actually comparable across a player and a pick in the same trade).
 
-Estimate a matchup, any two rosters, kicker and defense included if you want, players by name or `player_id`:
+Estimate a matchup for a specific week, any two rosters, kicker and defense included if you want, players by name or `player_id`:
 
 ```
-uv run dynasty-agent predict-matchup \
+uv run dynasty-agent predict-matchup --week 1 \
   --team-a "Jalen Hurts" --team-a "Derrick Henry" --team-a "Puka Nacua" \
   --team-b "Jayden Daniels" --team-b "James Cook" --team-b "Drake London"
 ```
+
+`--week` is required, it picks up real Vegas lines for that week from nflverse's own free schedules data (no paid odds API, no API key). The FPPG baseline season and the Vegas season are two different numbers on purpose, `--season` defaults to the most recently completed season (there's usually no current-season data yet) while `--vegas-season` defaults to whatever season is actually live right now, per your last `sync`. Override either if you're checking a specific past week.
 
 Every command reruns fresh against whatever's cached in `data/` (git-ignored, local SQLite plus downloaded nflverse parquet files). Nothing here needs a server or an account beyond your own Sleeper login.
 
@@ -83,7 +85,7 @@ Every command reruns fresh against whatever's cached in `data/` (git-ignored, lo
 - **Age curve**: flat at full value through a position's peak, then an exponential decay past it, tuned per position (see `metrics.AGE_CURVES`).
 - **Situation score**: a team's QB passing EPA, pass rate over expected, and sack rate allowed (inverted, a public proxy for offensive line quality), each percentile-ranked against all 32 NFL teams and averaged.
 - **Pick values**: anchored to FantasyCalc's real current price for a `<round>` pick, discounted forward per year by `--discount-rate` (default 20%/year).
-- **Matchup win probability** (`predict-matchup`) sums each side's players' real per-season mean and variance of weekly fantasy points, discounts the mean for current injury status, and reads the win probability off the normal distribution of the resulting margin, the same idea Vegas spread-to-moneyline conversion uses. Read this one as a **draft heuristic, not a fitted model**: nothing here is calibrated against real game outcomes, and it assumes players score independently of their teammates, which isn't quite true (a QB and his own WR1 correlate). It's grounded in real per-player data, it's just not a validated prediction, and it's a first draft toward a real prediction mode with a trade bot on top, not that thing itself.
+- **Matchup win probability** (`predict-matchup`) takes each side's players' real per-season mean and *sample* variance of weekly fantasy points (Bessel's correction, dividing by n-1, an earlier draft divided by n and understated it), scales the mean by a real Vegas-implied team total for the specific week versus that team's own season norm (nflverse's free schedules data, `spread_line`/`total_line`, no paid odds API), widens or collapses variance by current injury status (Questionable/Doubtful is closer to bimodal than a healthy player's normal week-to-week swing, so it widens; Out/IR collapses toward near-certain zero), and reads the win probability off the normal distribution of the resulting margin, the same idea Vegas spread-to-moneyline conversion uses. Read this one as a **draft heuristic, not a fitted model**: nothing here is calibrated against real game outcomes, and it assumes players score independently of their teammates, which isn't quite true (a QB and his own WR1 correlate). It's grounded in real per-player, per-week data at every step, it's just not a validated prediction, and it's a first draft toward a real prediction mode with a trade bot on top, not that thing itself.
 
 Every one of these is a plain, readable function in `src/dynasty_agent/metrics.py`, unit tested in `tests/test_metrics.py`, not a black box.
 

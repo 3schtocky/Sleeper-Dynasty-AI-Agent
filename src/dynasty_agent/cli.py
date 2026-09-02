@@ -301,20 +301,44 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
         print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
         raise SystemExit(1)
 
+    if args.vegas_season is not None:
+        vegas_season = args.vegas_season
+    else:
+        # The real current NFL season from the last `sync`, not a guess.
+        # Do not infer this from `season` (the FPPG baseline season): week 1
+        # of a completed season already has real closing lines from last
+        # year's game, so any presence-based fallback silently prices the
+        # wrong year. See matchup.predict_matchup's docstring.
+        state_row = conn.execute("SELECT season FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
+        if state_row is None:
+            print(
+                "No synced NFL state to determine the current season. Run `dynasty-agent sync` first, "
+                "or pass --vegas-season explicitly.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        vegas_season = int(state_row["season"])
+
     try:
-        result = matchup.predict_matchup(conn, season, args.team_a or [], args.team_b or [])
+        result = matchup.predict_matchup(conn, season, vegas_season, args.week, args.team_a or [], args.team_b or [])
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
     print(
-        f"Matchup prediction, {season} season basis. DRAFT MODEL, a heuristic, not a fitted or calibrated "
-        f"prediction, see matchup.py and PLANNING.md.\n"
+        f"Matchup prediction, {season} season FPPG basis, week {args.week} of the {vegas_season} season. "
+        f"DRAFT MODEL, a heuristic, not a fitted or calibrated prediction, see matchup.py and PLANNING.md."
     )
+    if not result["week_has_vegas_data"]:
+        print(f"No Vegas lines published yet for {vegas_season} week {args.week}. Running on season averages only, no week adjustment.")
+    print()
 
     def print_side(label: str, side: dict) -> None:
         print(f"{label}:")
         for p in side["players"]:
+            if p["on_bye"]:
+                print(f"  {p['full_name']:<20} {p['position'] or '':<4} {p['team'] or '':<4}   BYE WEEK, counted as 0")
+                continue
             flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
             if p["games"] == 0:
                 data_note = "  NO DATA THIS SEASON"
@@ -322,9 +346,10 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
                 data_note = f"  only {p['games']} game, variance not estimable, counted as 0"
             else:
                 data_note = f"  over {p['games']} games"
+            vegas_note = f", vegas x{p['vegas_multiplier']:.2f}" if p["vegas_multiplier"] != 1.0 else ""
             print(
                 f"  {p['full_name']:<20} {p['position'] or '':<4} {p['team'] or '':<4} "
-                f"{p['adjusted_mean']:>5.1f} avg{flag}{data_note}"
+                f"{p['adjusted_mean']:>5.1f} avg{vegas_note}{flag}{data_note}"
             )
         print(f"  Team mean: {side['mean']:.1f}, std dev: {side['variance'] ** 0.5:.1f}\n")
 
@@ -408,7 +433,15 @@ def main() -> None:
     predict_parser.add_argument("--team-a", action="append", metavar="PLAYER", help="A player on team A. Repeatable.")
     predict_parser.add_argument("--team-b", action="append", metavar="PLAYER", help="A player on team B. Repeatable.")
     predict_parser.add_argument(
-        "--season", type=int, default=None, help="Defaults to the most recently ingested season."
+        "--week", type=int, required=True, help="The NFL week to predict, used to look up real Vegas lines for that week."
+    )
+    predict_parser.add_argument(
+        "--season", type=int, default=None,
+        help="FPPG/variance baseline season. Defaults to the most recently ingested season.",
+    )
+    predict_parser.add_argument(
+        "--vegas-season", type=int, default=None,
+        help="Season --week's Vegas lines belong to. Defaults to the real current NFL season from the last sync.",
     )
     predict_parser.set_defaults(func=cmd_predict_matchup)
 

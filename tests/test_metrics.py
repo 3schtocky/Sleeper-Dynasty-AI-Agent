@@ -15,6 +15,7 @@ from dynasty_agent.metrics import (
     situation_multiplier,
     three_year_age_factor,
     three_year_value,
+    vegas_week_multiplier,
     weighted_opportunity,
     win_now_value,
     yards_per_route_run_estimate,
@@ -299,3 +300,27 @@ def test_discounted_pick_value_compounds_per_year():
 
 def test_discounted_pick_value_never_gives_a_bonus_for_negative_years():
     assert discounted_pick_value(1000.0, years_from_base=-3, discount_rate=0.20) == 1000.0
+
+
+# -- vegas week multiplier -------------------------------------------------------
+
+
+def test_vegas_week_multiplier_scales_by_the_ratio():
+    # implied for 27 this week, 21 average all year -> scaled up
+    assert round(vegas_week_multiplier(27.0, 21.0), 4) == round(27.0 / 21.0, 4)
+
+
+def test_vegas_week_multiplier_is_a_noop_when_this_week_matches_the_season_average():
+    assert vegas_week_multiplier(22.0, 22.0) == 1.0
+
+
+def test_vegas_week_multiplier_is_neutral_without_a_week_1_baseline():
+    assert vegas_week_multiplier(24.0, None) == 1.0
+
+
+def test_vegas_week_multiplier_is_neutral_without_a_published_line():
+    assert vegas_week_multiplier(None, 21.0) == 1.0
+
+
+def test_vegas_week_multiplier_is_neutral_with_neither_input():
+    assert vegas_week_multiplier(None, None) == 1.0

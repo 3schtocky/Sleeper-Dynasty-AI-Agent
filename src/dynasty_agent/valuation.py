@@ -42,7 +42,7 @@ PICK_VALUE_BASE_SEASON = 2027
 TEAM_ALIASES: dict[str, str] = {"LAR": "LA"}
 
 
-def _to_nflverse_team(team: str | None) -> str | None:
+def to_nflverse_team(team: str | None) -> str | None:
     if team is None:
         return None
     return TEAM_ALIASES.get(team, team)
@@ -136,7 +136,7 @@ def player_valuations(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
 
     result: dict[str, dict] = {}
     for row in rows:
-        team_situation = situations.get(_to_nflverse_team(row["team"]), {}).get("situation_score", 50.0)
+        team_situation = situations.get(to_nflverse_team(row["team"]), {}).get("situation_score", 50.0)
         prod = production_score(row["fppg"], row["position"])
         result[row["player_id"]] = {
             "full_name": row["full_name"],
