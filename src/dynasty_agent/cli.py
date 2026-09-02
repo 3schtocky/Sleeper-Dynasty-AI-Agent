@@ -316,7 +316,12 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
         print(f"{label}:")
         for p in side["players"]:
             flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
-            data_note = "  NO DATA THIS SEASON" if p["games"] == 0 else f"  over {p['games']} games"
+            if p["games"] == 0:
+                data_note = "  NO DATA THIS SEASON"
+            elif p["thin_sample"]:
+                data_note = f"  only {p['games']} game, variance not estimable, counted as 0"
+            else:
+                data_note = f"  over {p['games']} games"
             print(
                 f"  {p['full_name']:<20} {p['position'] or '':<4} {p['team'] or '':<4} "
                 f"{p['adjusted_mean']:>5.1f} avg{flag}{data_note}"

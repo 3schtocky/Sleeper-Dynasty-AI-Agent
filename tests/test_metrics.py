@@ -5,11 +5,13 @@ from dynasty_agent.metrics import (
     compute_fantasy_points,
     discounted_pick_value,
     injury_adjusted_mean,
+    injury_adjusted_variance,
     map_snapshot_to_week,
     matchup_win_probability,
     normal_cdf,
     percentile_rank,
     production_score,
+    sample_mean_variance,
     situation_multiplier,
     three_year_age_factor,
     three_year_value,
@@ -194,6 +196,59 @@ def test_injury_adjusted_mean_applies_the_right_multiplier():
     assert injury_adjusted_mean(20.0, "Out") == 0.0
     assert injury_adjusted_mean(20.0, None) == 20.0
     assert injury_adjusted_mean(20.0, "") == 20.0
+
+
+def test_injury_adjusted_variance_widens_for_questionable_and_doubtful():
+    # Bimodal risk (plays a full game or gets scratched) widens variance,
+    # it does not narrow it the way the mean multiplier does.
+    assert injury_adjusted_variance(10.0, "Questionable") == 20.0
+    assert injury_adjusted_variance(10.0, "Doubtful") == 30.0
+
+
+def test_injury_adjusted_variance_collapses_for_out():
+    # Near-certain zero production means near-certain zero spread too.
+    assert injury_adjusted_variance(10.0, "Out") == 1.0
+
+
+def test_injury_adjusted_variance_is_a_noop_when_healthy():
+    assert injury_adjusted_variance(10.0, None) == 10.0
+    assert injury_adjusted_variance(10.0, "") == 10.0
+
+
+def test_sample_mean_variance_uses_bessel_correction_not_population_variance():
+    # 4, 8, 6, 10 games: mean 7, sum of squared deviations from the mean is
+    # 9+1+1+9=20. Sample variance divides by n-1=3, not n=4.
+    mean, variance, n = sample_mean_variance([4.0, 8.0, 6.0, 10.0])
+    assert mean == 7.0
+    assert round(variance, 6) == round(20.0 / 3, 6)
+    assert n == 4
+
+
+def test_sample_mean_variance_matches_a_known_textbook_example():
+    # Classic example: {2, 4, 4, 4, 5, 5, 7, 9}, population std is 2.0,
+    # sample variance (n-1) is population_variance * n / (n-1) = 4 * 8/7.
+    values = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    mean, variance, n = sample_mean_variance(values)
+    assert mean == 5.0
+    assert round(variance, 4) == round(4.0 * 8 / 7, 4)
+    assert n == 8
+
+
+def test_sample_mean_variance_is_none_for_fewer_than_two_points():
+    assert sample_mean_variance([]) == (0.0, None, 0)
+    mean, variance, n = sample_mean_variance([12.0])
+    assert mean == 12.0
+    assert variance is None
+    assert n == 1
+
+
+def test_sample_mean_variance_never_divides_by_zero():
+    # A regression guard: the old population-variance formula (/n) never
+    # divided by zero either, but silently returned 0.0 for a single point
+    # instead of flagging that no real estimate exists.
+    for values in ([], [5.0]):
+        mean, variance, n = sample_mean_variance(values)
+        assert variance is None
 
 
 def test_normal_cdf_known_values():

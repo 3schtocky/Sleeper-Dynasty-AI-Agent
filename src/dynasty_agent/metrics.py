@@ -205,10 +205,73 @@ def injury_adjusted_mean(raw_mean: float, injury_status: str | None) -> float:
     return raw_mean * INJURY_MEAN_MULTIPLIER.get(injury_status or "", 1.0)
 
 
+# An injury designation doesn't just lower expected production, it changes
+# the SHAPE of the outcome. Out/IR/Suspended collapses toward near-certain
+# zero: both mean and spread shrink. Questionable/Doubtful is closer to
+# bimodal, plays close to a full workload or gets scratched/limited, than a
+# healthy player's normal week-to-week swing, so variance widens instead of
+# narrowing. Scaling only the mean (as an earlier version of this module
+# did) and leaving variance untouched understates exactly the uncertainty
+# an injury tag is supposed to signal. Same caveat as INJURY_MEAN_MULTIPLIER:
+# round, labeled numbers, not fitted from outcome data.
+INJURY_VARIANCE_MULTIPLIER: dict[str, float] = {
+    "Out": 0.1,
+    "IR": 0.1,
+    "Suspended": 0.1,
+    "Doubtful": 3.0,
+    "Questionable": 2.0,
+}
+
+
+def injury_adjusted_variance(raw_variance: float, injury_status: str | None) -> float:
+    return raw_variance * INJURY_VARIANCE_MULTIPLIER.get(injury_status or "", 1.0)
+
+
+def sample_mean_variance(values: list[float]) -> tuple[float, float | None, int]:
+    """Mean and unbiased SAMPLE variance (Bessel's correction: divide by
+    n - 1, not n) of a list of real observations, plus the count.
+
+    An earlier version of this divided by n, the population-variance
+    formula, which is wrong here: a season's games are a sample used to
+    estimate a player's true week-to-week variance, not the entire
+    population of possible outcomes, and dividing by n systematically
+    understates that variance. The understatement is worst exactly where it
+    matters most, players with few games, which is also where this feeds a
+    win-probability model that then reads as more confident than the data
+    supports.
+
+    A sample variance is undefined from fewer than two points: variance is
+    None for n < 2 rather than silently returning 0.0, which would read as
+    real certainty instead of missing data. An empty list returns
+    (0.0, None, 0).
+    """
+    n = len(values)
+    if n == 0:
+        return 0.0, None, 0
+    mean = sum(values) / n
+    if n == 1:
+        return mean, None, 1
+    variance = sum((x - mean) ** 2 for x in values) / (n - 1)
+    return mean, variance, n
+
+
 def normal_cdf(z: float) -> float:
     """Standard normal cumulative distribution function, via math.erf so
     this has no dependency on scipy or numpy."""
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+def vegas_week_multiplier(team_implied_this_week: float | None, team_season_avg_implied: float | None) -> float:
+    """How much better or worse Vegas expects a team to score in one
+    specific week versus that same team's own season norm, derived from
+    real spread_line/total_line data (see matchup.team_week_implied_points),
+    never a hardcoded per-team bias. Returns 1.0, a no-op, when either
+    number is missing: no line published yet for this week, or no prior
+    weeks this season to establish a baseline (week 1). Never guesses a
+    direction when the inputs don't support one."""
+    if not team_implied_this_week or not team_season_avg_implied:
+        return 1.0
+    return team_implied_this_week / team_season_avg_implied
 
 
 def matchup_win_probability(mean_diff: float, std_diff: float) -> float:

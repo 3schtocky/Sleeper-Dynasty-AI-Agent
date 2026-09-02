@@ -29,17 +29,23 @@ from __future__ import annotations
 
 import sqlite3
 
-from dynasty_agent.metrics import injury_adjusted_mean, matchup_win_probability
+from dynasty_agent.metrics import (
+    injury_adjusted_mean,
+    injury_adjusted_variance,
+    matchup_win_probability,
+    sample_mean_variance,
+)
 from dynasty_agent.valuation import resolve_player
 
 
-def player_weekly_distribution(conn: sqlite3.Connection, player_id: str, season: int) -> tuple[float, float, int]:
-    """A player's mean and population variance of weekly fantasy points in
-    a season, from real games, plus the game count backing it. (0.0, 0.0, 0)
-    for a player with no rows that season, for example a rookie who hasn't
-    played yet or a kicker/defense this project's nflverse ingestion
-    doesn't carry (see nflverse.py: kicking and team defense aren't in the
-    per-player pipeline built here)."""
+def player_weekly_distribution(conn: sqlite3.Connection, player_id: str, season: int) -> tuple[float, float | None, int]:
+    """A player's mean and unbiased sample variance (see
+    metrics.sample_mean_variance) of weekly fantasy points in a season, from
+    real games, plus the game count backing it. variance is None for fewer
+    than 2 games, a sample variance is undefined from 0 or 1 points, that
+    includes a rookie who hasn't played yet or a kicker/defense this
+    project's nflverse ingestion doesn't carry (see nflverse.py: kicking and
+    team defense aren't in the per-player pipeline built here)."""
     rows = [
         r[0]
         for r in conn.execute(
@@ -47,11 +53,7 @@ def player_weekly_distribution(conn: sqlite3.Connection, player_id: str, season:
             (player_id, str(season)),
         ).fetchall()
     ]
-    if not rows:
-        return 0.0, 0.0, 0
-    mean = sum(rows) / len(rows)
-    variance = sum((x - mean) ** 2 for x in rows) / len(rows)
-    return mean, variance, len(rows)
+    return sample_mean_variance(rows)
 
 
 def _value_matchup_side(conn: sqlite3.Connection, season: int, names: list[str]) -> dict:
@@ -60,8 +62,14 @@ def _value_matchup_side(conn: sqlite3.Connection, season: int, names: list[str])
     variance_total = 0.0
     for name_or_id in names:
         p = resolve_player(conn, name_or_id)
-        raw_mean, variance, games = player_weekly_distribution(conn, p["player_id"], season)
+        raw_mean, raw_variance, games = player_weekly_distribution(conn, p["player_id"], season)
         adjusted_mean = injury_adjusted_mean(raw_mean, p["injury_status"])
+        # A None raw_variance (0 or 1 games) means there is no sample-based
+        # estimate at all, not that the true variance is zero. Contributing
+        # 0.0 here is the same "insufficient data, treat as absent from the
+        # variance side of the model" choice already made for a 0-game
+        # player; games <= 1 gets flagged below so it's visible, not hidden.
+        adjusted_variance = injury_adjusted_variance(raw_variance, p["injury_status"]) if raw_variance is not None else 0.0
         players.append(
             {
                 "full_name": p["full_name"],
@@ -70,12 +78,13 @@ def _value_matchup_side(conn: sqlite3.Connection, season: int, names: list[str])
                 "injury_status": p["injury_status"],
                 "raw_mean": raw_mean,
                 "adjusted_mean": adjusted_mean,
-                "variance": variance,
+                "variance": adjusted_variance,
+                "thin_sample": games <= 1,
                 "games": games,
             }
         )
         mean_total += adjusted_mean
-        variance_total += variance
+        variance_total += adjusted_variance
     return {"players": players, "mean": mean_total, "variance": variance_total}
 
 
