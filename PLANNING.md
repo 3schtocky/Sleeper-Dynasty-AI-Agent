@@ -63,19 +63,31 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 
 **Same constraint as Phase 3: quantitative first.** The prospect board ranks on quantifiable inputs, draft capital, college production metrics (dominator rating), breakout age, athletic testing, with stated weights per position matching this league's actual scoring, not subjective scouting takes. Where a number can be sourced and computed, it gets computed; sentiment-only inputs stay explicitly labeled as such and never substitute for a real underlying stat, the same standard Phase 2 already set with win-now/three-year value and the trade evaluator's arbitrage math.
 
-### Open questions to confirm first
-- [ ] Prospect data source. Draft capital, landing spot, college dominator rating, breakout age, and athletic testing are not in nflverse's player-week files. Needs a source before the prospect board can be built.
-- [ ] Pre-draft vs. post-draft mode switch. Confirm whether this is a CLI flag or an automatic switch keyed off the NFL draft date.
+### Open questions, confirmed
+- [x] Prospect data source: both. nflverse's `draft_picks` and `combine` releases (free, no key) for draft capital, landing spot, and athletic testing; the College Football Data API (`collegefootballdata.com`, free tier, needs a registered key) for college production, dominator rating and breakout age computed from real raw stats, not a paywalled aggregator's pre-computed number.
+- [x] Pre-draft vs. post-draft mode switch: an explicit CLI flag, not an automatic date switch. An automatic switch risks the same failure shape as the earlier Vegas-season bug in `matchup.py` (guessing a value when the real one isn't resolvable yet); a flag stays explicit.
+
+**Real, live-verified finding that changes what "pre-draft mode" can show, surfaced before any ranking code got written:** `draft_picks` and `combine` are post-draft-only by definition, checked live, not assumed. `draft_picks` already carries the real, already-drafted 2026 class (spot-checked: Carnell Tate, pick 4, Ohio St.) but nothing for 2027, because that draft has not happened. Same for `combine` (season range tops out at 2026; the 2027 combine runs next February). This league's inaugural startup already covered veterans, so its next real rookie draft is the 2027 class, meaning real draft capital, landing spot, and athletic testing for the players who actually matter to that draft do not exist yet, full stop, not a data-source problem to solve, a real calendar constraint.
+
+Given that, confirmed with the user: until real draft capital exists, the pre-draft board ranks on real college production only (CFBD-derived dominator rating and breakout age), no mock-draft capital or landing spot blended in. A second layer, adding early mock-draft consensus as an explicitly labeled sentiment input (never blended into the quantitative score, same bucket as Reddit/beat-writer chatter), is planned for later, not yet built, noted in `README.md` so it stays visible. Once analysis of the real production metrics is in, a recommendation on how (or whether) to weight that consensus layer against real production comes back here rather than being guessed now.
+
+**Two more real, live-verified findings, the same bug shape as the Sleeper/nflverse `LAR`/`LA` team-code mismatch already found once in `valuation.py`:**
+- `draft_picks.team` ships PFR-style codes (`GNB`, `KAN`, `LAR`, `LVR`, `NOR`, `NWE`, `SFO`, `TAM`), not this project's standard nflverse codes (`GB`, `KC`, `LA`, `LV`, `NO`, `NE`, `SF`, `TB`). Confirmed against every distinct code in the live file; the other 24 of 32 already match. Fixed by `prospects.to_nflverse_team_from_draft_code`, a crosswalk in the same style as `valuation.TEAM_ALIASES`, applied at ingest time so `nfl_draft_picks.team` is directly comparable to `weekly_stats.team` with no second lookup at read time. Unit tested in `tests/test_prospects.py`.
+- `combine.draft_team` ships as a full franchise name (`"San Francisco 49ers"`), a third format, and its `season`/`draft_year` columns disagree on 8 of 8968 real rows (undrafted combine invitees and a few data gaps). Kept `draft_team` as informational only, not normalized or treated as a second source of truth; `nfl_draft_picks.team`, crosswalked from the same PFR pick, is the one authoritative landing-spot code. `draft_year`, not `season`, is the real draft year.
+
+Also, an existing table in this project is already named `draft_picks` (this league's own Sleeper rookie-draft results). The new nflverse tables are named `nfl_draft_picks` / `nfl_combine`, confirmed the collision before naming anything, not assumed.
 
 ### Build order
-1. [ ] Prospect board ingestion from whatever source gets confirmed.
-2. [ ] Two weighting modes, pre-NFL-draft and post-NFL-draft.
-3. [ ] Position weighting to match league scoring, receivers up, quarterbacks down.
-4. [ ] Taxi-slot modeling against the 3 available slots.
-5. [ ] Cross-reference against rookie pick market values for buy, hold, or sell-the-pick guidance.
+1. [x] `draft_picks` and `combine` ingestion: `src/dynasty_agent/prospects.py`, migration `0003_prospects.sql`, `dynasty-agent ingest-draft-data`. Verified live: 12,927 real draft picks and 7,434 combine rows landed (7,437 raw rows processed; 3 real duplicate `(season, pfr_id)` keys exist in nflverse's own combine file, a data quality quirk on their end, not an ingestion bug, documented in `ingest_combine`'s docstring). Team normalization spot-checked (a real 2024 49ers pick reads back as `SF`, not `SFO`).
+2. [ ] CFBD ingestion (college production stats) and the dominator rating / breakout age formulas. Blocked on the user registering a free CFBD API key (`collegefootballdata.com/key`) and adding it to `.env` as `CFBD_API_KEY`; scaffolded in `config.py` and `.env.example` so this is a drop-in once the key exists. Confirmed live that CFBD requires it (unauthenticated calls return 401).
+3. [ ] Prospect board ranking: pre-draft mode (real college production only) first; the `--mode` CLI flag and post-draft mode (draft capital + landing spot + testing, all now real once the 2027 draft happens) come after.
+4. [ ] Position weighting to match league scoring, receivers up, quarterbacks down.
+5. [ ] Taxi-slot modeling against the 3 available slots.
+6. [ ] Cross-reference against rookie pick market values for buy, hold, or sell-the-pick guidance.
+7. [ ] Later, not yet scoped: the labeled mock-draft-consensus layer described above.
 
 ### Acceptance test
-A ranked prospect board for the next rookie draft, with a recommendation on any picks currently held.
+A ranked prospect board for the next rookie draft, with a recommendation on any picks currently held. Not built yet; `ingest-draft-data` is the data layer underneath it.
 
 ## Out-of-band: ad hoc matchup prediction — DRAFT
 

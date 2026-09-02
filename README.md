@@ -17,8 +17,9 @@ It is built for **one specific league shape**: 12 teams, 1QB, full PPR, no TE pr
 - **`optimize-lineup`** — the starting lineup, out of your real roster, that maximizes win probability against your actual Sleeper opponent for a given week, not raw projected points. Reports the highest-raw-points lineup alongside for comparison, since they can differ.
 - **`faab`** — a sized FAAB bid for one waiver target, against your real remaining budget, real weeks left before the playoffs, and how that target's real win-now value compares to everyone else actually available right now.
 - **`digest`** — the weekly brief: recommended lineup and win probability, real wind flags for your starters' games, top bench options, and sized suggestions for the best available waiver targets, all in one command.
+- **`ingest-draft-data`** *(Phase 4, in progress)* — caches real NFL draft picks and combine testing results (nflverse's `draft_picks`/`combine`, whole-history files). Data layer only; there's no ranked prospect board command yet.
 
-What it doesn't do yet: rookie draft prep. See `PLANNING.md` for where that stands.
+What it doesn't do yet: a ranked rookie prospect board. `ingest-draft-data` above is the first piece. The rest is blocked on two things: draft capital, landing spot, and athletic testing don't exist yet for this league's actual next rookie class (the 2027 NFL draft hasn't happened; confirmed live against nflverse's own data), and college production (dominator rating, breakout age) needs a College Football Data API key, not yet added. Until real draft capital exists for that class, a pre-draft board is planned to rank on real college production numbers only, nothing qualitative blended in. **Planned next**, once real draft capital or a stable mock-draft consensus source is picked: layer that in too, explicitly labeled as sentiment (like Reddit/beat-writer chatter elsewhere in this project), never blended into the quantitative score. See `PLANNING.md` for the full detail.
 
 ## Requirements
 
@@ -59,6 +60,7 @@ uv run dynasty-agent sync                          # your league, rosters, and m
 uv run dynasty-agent roster                         # sanity check: is this your team?
 uv run dynasty-agent ingest-nflverse --season 2025  # the most recently completed NFL season
 uv run dynasty-agent valuate                        # win-now/three-year value + the verdict
+uv run dynasty-agent ingest-draft-data               # Phase 4 data layer: real NFL draft picks + combine
 ```
 
 Evaluate a trade, players by name (fuzzy-matched) or Sleeper `player_id`, picks as `<season>-<round>`:

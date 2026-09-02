@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import config, market, matchup, nflverse, sleeper, valuation, weather, weekly
+from dynasty_agent import config, market, matchup, nflverse, prospects, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -127,6 +127,11 @@ def cmd_ingest_nflverse(args: argparse.Namespace) -> None:
         raise SystemExit(1)
     scoring_settings = json.loads(league["scoring_settings_json"])
     print(nflverse.ingest_season(conn, args.season, scoring_settings))
+
+
+def cmd_ingest_draft_data(args: argparse.Namespace) -> None:
+    conn = get_db()
+    print(prospects.ingest_draft_data(conn, force=args.force))
 
 
 def _latest_ingested_season(conn) -> int | None:
@@ -549,6 +554,16 @@ def main() -> None:
     )
     ingest_parser.add_argument("--season", type=int, required=True)
     ingest_parser.set_defaults(func=cmd_ingest_nflverse)
+
+    ingest_draft_parser = sub.add_parser(
+        "ingest-draft-data",
+        help="[Phase 4] Cache and upsert real NFL draft picks and combine testing results "
+        "(nflverse draft_picks + combine, whole-history flat files, not season-scoped).",
+    )
+    ingest_draft_parser.add_argument(
+        "--force", action="store_true", help="Re-download even if already cached, to pick up nflverse's latest update."
+    )
+    ingest_draft_parser.set_defaults(func=cmd_ingest_draft_data)
 
     valuate_parser = sub.add_parser(
         "valuate",
