@@ -6,13 +6,63 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import market, nflverse, valuation
-from dynasty_agent.config import SLEEPER_USER_ID
+from dynasty_agent import config, market, nflverse, sleeper, valuation
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
 
+def _require_config() -> None:
+    missing = config.missing_config()
+    if missing:
+        print(
+            f"Missing config: {', '.join(missing)}. Run "
+            f"`dynasty-agent init --username <your sleeper username>` to set it up, "
+            f"or copy .env.example to .env and fill it in by hand.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    user = sleeper.lookup_user(args.username)
+    if user is None:
+        print(f"No Sleeper user found for username '{args.username}'.", file=sys.stderr)
+        raise SystemExit(1)
+    user_id = user["user_id"]
+
+    season = current_season = sleeper.current_nfl_season()
+    leagues = sleeper.list_leagues_for_season(user_id, season)
+    if not leagues:
+        print(f"'{args.username}' has no {season} NFL leagues on Sleeper.", file=sys.stderr)
+        raise SystemExit(1)
+
+    if args.league_id:
+        league = next((league for league in leagues if league["league_id"] == args.league_id), None)
+        if league is None:
+            print(f"'{args.username}' is not in a {season} league with id {args.league_id}.", file=sys.stderr)
+            raise SystemExit(1)
+    elif len(leagues) == 1:
+        league = leagues[0]
+    else:
+        print(f"'{args.username}' is in {len(leagues)} {season} leagues:\n")
+        for league in leagues:
+            print(f"  {league['league_id']}  {league['name']}")
+        print(f"\nRe-run with --league-id <id> to pick one.")
+        raise SystemExit(1)
+
+    config.ENV_PATH.write_text(
+        f"SLEEPER_USERNAME={args.username}\n"
+        f"SLEEPER_USER_ID={user_id}\n"
+        f"LEAGUE_ID={league['league_id']}\n"
+        f"DRAFT_ID={league.get('draft_id') or ''}\n"
+    )
+    print(f"Wrote {config.ENV_PATH}")
+    print(f"League: {league['name']} ({league['league_id']}, {current_season} season)")
+    print("Next: `dynasty-agent sync`")
+
+
 def cmd_sync(args: argparse.Namespace) -> None:
+    _require_config()
     conn = get_db()
     with SleeperClient(conn) as client:
         client.sync_all()
@@ -21,9 +71,10 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
 
 def cmd_roster(args: argparse.Namespace) -> None:
+    _require_config()
     conn = get_db()
     roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (SLEEPER_USER_ID,)
+        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
     ).fetchone()
     if roster is None:
         print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
@@ -81,9 +132,10 @@ def _latest_ingested_season(conn) -> int | None:
 
 
 def cmd_valuate(args: argparse.Namespace) -> None:
+    _require_config()
     conn = get_db()
     roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (SLEEPER_USER_ID,)
+        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
     ).fetchone()
     if roster is None:
         print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
@@ -161,9 +213,10 @@ def _parse_pick(spec: str) -> tuple[int, int]:
 
 
 def cmd_trade(args: argparse.Namespace) -> None:
+    _require_config()
     conn = get_db()
     roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (SLEEPER_USER_ID,)
+        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
     ).fetchone()
     if roster is None:
         print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
@@ -242,6 +295,15 @@ def main() -> None:
         prog="dynasty-agent", description="Dynasty fantasy football agent for a Sleeper league."
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = sub.add_parser(
+        "init", help="Set up .env for your own Sleeper league: username, user_id, league_id, draft_id."
+    )
+    init_parser.add_argument("--username", required=True, help="Your Sleeper username.")
+    init_parser.add_argument(
+        "--league-id", default=None, help="Pick a specific league if --username is in more than one this season."
+    )
+    init_parser.set_defaults(func=cmd_init)
 
     sub.add_parser(
         "sync",

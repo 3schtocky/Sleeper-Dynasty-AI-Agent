@@ -27,6 +27,38 @@ MAX_CALLS_PER_MINUTE = 1000
 PLAYERS_REFRESH_INTERVAL = timedelta(days=1)
 
 
+# -- onboarding: standalone, uncached, no DB connection needed --------------
+#
+# These back `dynasty-agent init`, which runs before any league is
+# configured, so they can't be SleeperClient methods, that class requires a
+# database connection to construct. A one-time setup call has no need for
+# the cache or rate limiter machinery below either.
+
+
+def lookup_user(username: str) -> dict | None:
+    """GET /v1/user/<username>. None if Sleeper doesn't recognize the
+    username, it returns a bare `null` body for that case rather than a
+    404."""
+    response = httpx.get(f"{BASE_URL}/user/{username}", timeout=15.0)
+    response.raise_for_status()
+    return response.json()
+
+
+def current_nfl_season() -> str:
+    response = httpx.get(f"{BASE_URL}/state/nfl", timeout=15.0)
+    response.raise_for_status()
+    return response.json()["season"]
+
+
+def list_leagues_for_season(user_id: str, season: str) -> list[dict]:
+    """GET /v1/user/<user_id>/leagues/nfl/<season>. Each league object
+    already carries its own draft_id, confirmed against a live response
+    rather than assumed, so no separate draft lookup is needed."""
+    response = httpx.get(f"{BASE_URL}/user/{user_id}/leagues/nfl/{season}", timeout=15.0)
+    response.raise_for_status()
+    return response.json()
+
+
 class RateLimiter:
     """Keeps calls under a per-minute ceiling with a sliding window. At our
     actual call volumes this almost never sleeps; it exists as a floor, not

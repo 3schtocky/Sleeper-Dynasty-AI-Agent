@@ -8,6 +8,7 @@ dependencies = [
     "duckdb>=1.5.5",
     "httpx>=0.28.1",
     "pyarrow>=25.0.1",
+    "python-dotenv>=1.2.3",
 ]
 
 [project.scripts]
