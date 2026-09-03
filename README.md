@@ -34,6 +34,19 @@ College box-score production (dominator rating, breakout age) has no working dat
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
 - A Sleeper account that's a member of at least one dynasty league. You don't need an API key, Sleeper's read API is public.
+- For the conversational agent (`chat`/`ask`): [LM Studio](https://lmstudio.ai)'s local server, running. The one-line install below sets this up for you, headlessly, no GUI app required.
+
+## One-line install
+
+Everything (`uv`, LM Studio's local model server, and `dynasty-agent` itself, installed globally) in one shot:
+
+```
+curl -fsSL https://raw.githubusercontent.com/3schtocky/Sleeper-Dynasty-AI-Agent/main/install.sh | bash
+```
+
+That's [`install.sh`](install.sh) in the repo root, a short, plain script, read it first if you'd rather know exactly what it does. It checks for `uv` and LM Studio's headless CLI (`lms`, LM Studio's own official headless installer, not this project's, installs to `~/.lmstudio/bin`, no GUI app ever required), installs whichever it doesn't find, pulls and loads the local model, installs `dynasty-agent` as a real global command via `uv tool install`, and walks you through `dynasty-agent init`. On Windows, the equivalent is [`install.ps1`](install.ps1), see [`WINDOWS.md`](WINDOWS.md).
+
+Prefer to see and run each step yourself? The manual walkthrough below gets you to the same place.
 
 ## Install
 

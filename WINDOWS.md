@@ -10,6 +10,16 @@ If you hit something this guide doesn't cover, the "How the numbers work" and co
 - **PowerShell**, not the old `cmd.exe`. Every command below is PowerShell syntax. Windows 11 opens PowerShell by default when you right-click in a folder and choose "Open in Terminal"; on Windows 10, search the Start menu for "PowerShell" (Windows Terminal, if you have it installed, is the nicer experience but not required).
 - A Sleeper account that's a member of at least one dynasty league. No API key needed, Sleeper's read API is public.
 
+## One-line install
+
+Want the whole thing (uv, LM Studio's local model server, and `dynasty-agent` itself, installed globally) in one shot, including the conversational agent? Run:
+
+```powershell
+irm https://raw.githubusercontent.com/3schtocky/Sleeper-Dynasty-AI-Agent/main/install.ps1 | iex
+```
+
+That's `install.ps1` in the repo root, read it before running it if you'd rather know exactly what it does first, it's a short, plain script, same spirit as the `uv` installer above. It checks for `uv` and LM Studio's headless CLI (`lms`, no GUI app required, LM Studio's own official headless installer, not this project's), installs whichever it doesn't find, pulls and loads the local model, installs `dynasty-agent` as a real global command via `uv tool install`, and walks you through `dynasty-agent init`. Prefer the manual, step-by-step walkthrough below if you'd rather see and run each piece yourself, both get you to the same place.
+
 ## 1. Install Git, if you don't have it
 
 Check first:

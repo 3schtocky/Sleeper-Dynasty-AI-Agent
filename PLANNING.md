@@ -178,3 +178,24 @@ Builds directly on Phase 5's calibrated model: a Monte Carlo simulation of the l
 
 ### Acceptance test
 `dynasty-agent simulate-season --simulations 10000` run against real synced data: all 12 teams reported, real team names, the user's own team marked, `real_matchups_simulated` matches the real expected remaining-weeks x 6 count.
+
+## Phase 7: install/distribution overhaul
+
+Turns "clone and `uv sync`" into a real one-line install, and sets up the local LLM (Qwen3-4B via LM Studio) the conversational agent (Phase 8) will need. Correction surfaced by the user during this phase: the plan had wrongly assumed they already ran LM Studio; they don't, so this phase's install script is the thing that actually sets it up for them, fresh.
+
+### Open questions, confirmed
+- [x] Real `lms` CLI shape and the real Qwen3-4B identifier: **verified live**, not from documentation alone, run for real against a fresh headless install in this session's own sandbox (no GUI app needed, LM Studio 0.4.0's "llmster" headless installer, superseding the older "run the GUI once first" requirement). Real sequence run and its real output:
+  - `lms get "qwen/qwen3-4b-instruct-2507" -y` **failed live**: "does not exist or you do not have permission to read it." A real, clean rejection, not a guessable near-miss.
+  - `lms get "qwen/qwen3-4b" -y` succeeded, 2.28 GB. `lms load` confirmed the exact API/SDK identifier directly in its own output: `qwen/qwen3-4b`. `/v1/models` confirmed the same string back.
+  - **Correction from the original plan: use `qwen/qwen3-4b` (the hybrid-thinking April 2025 release), not the "-instruct-2507" refresh**, that identifier simply isn't a real Hub artifact under that name.
+- [x] Whether tool-calling actually works end to end through this exact model and server, directly de-risking Phase 8 before it's even started: **verified live**. A real `curl` to `/v1/chat/completions` with a `tools` array produced a clean `finish_reason: "tool_calls"`, correct function name, correctly parsed JSON arguments (`{"week":1}`) extracted from a natural-language prompt ("What is my win probability for week 1?"). A second test with an intentionally under-specified prompt (no week given) correctly declined to guess, asked a clarifying question, and returned `tool_calls: []`, exactly the "decline rather than guess" behavior Phase 8's system prompt design wants. One new real fact for Phase 8: LM Studio's response carries a non-standard `reasoning_content` field (this model's visible chain-of-thought) alongside the standard OpenAI schema; Phase 8's client code should tolerate extra fields, not assume a strict schema.
+
+### Build order
+1. [x] `install.sh` (macOS/Linux) and `install.ps1` (Windows): check/install `uv`, check/install LM Studio's headless CLI (`lms`, no GUI app), bring up the daemon, pull and load `qwen/qwen3-4b`, start the local server (idempotent-checked: skips `server start` if already running rather than assuming it's safe to call twice), `uv tool install` the repo from GitHub, walk through `dynasty-agent init`.
+2. [x] `WINDOWS.md`/`README.md`: a new "One-line install" section in each, pointing at the two scripts, the existing manual walkthroughs kept intact underneath exactly as they already do for `uv` itself. LM Studio added to `README.md`'s Requirements.
+
+### Verified live, not just written
+Full sequence run for real in this session's own sandbox: headless LM Studio install (real checksum-verified download) -> `lms daemon up` -> real model pull and load -> local server confirmed answering on port 1234 (`curl http://localhost:1234/v1/models`, real response) -> a real tool-calling round trip confirmed clean, see above. Separately, `uv tool install git+https://github.com/3schtocky/Sleeper-Dynasty-AI-Agent` run for real: resolved the real GitHub commit, built cleanly, "Installed 1 executable: dynasty-agent." Confirmed from `/tmp`, a directory outside the repo entirely: `dynasty-agent --help` and `dynasty-agent init --help` both work correctly against the real global install, proving `uv tool install` is a genuine, working one-command path, not just a plan.
+
+### Acceptance test
+Both scripts' full command sequences verified live as described above (macOS path executed directly; the Windows path translated with the same care `WINDOWS.md`'s own manual walkthrough already uses, this project's own tooling has no way to execute PowerShell to verify it directly, stated plainly). `uv run pytest` stays green throughout, no Python source changed this phase.
