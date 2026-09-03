@@ -20,6 +20,7 @@ from dynasty_agent.metrics import (
     injury_adjusted_variance,
     matchup_win_probability,
     percentile_rank,
+    platt_scale,
     vegas_week_multiplier,
 )
 from dynasty_agent.valuation import player_valuations, resolve_player, to_nflverse_team
@@ -199,7 +200,14 @@ def _starting_slot_counts(roster_positions: list[str]) -> dict[str, int]:
     return counts
 
 
-def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: int, week: int, my_roster_id: int) -> dict:
+def optimize_lineup(
+    conn: sqlite3.Connection,
+    stats_season: int,
+    vegas_season: int,
+    week: int,
+    my_roster_id: int,
+    calibration_params: tuple[float, float] | None = None,
+) -> dict:
     """The starting lineup, out of everyone eligible on my roster, that
     maximizes win probability against my actual Sleeper opponent this
     week, not raw projected points. Every valid lineup respecting this
@@ -211,7 +219,18 @@ def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: i
     they can differ. That gap is exactly what the original spec means by
     "the flex slot is the main lever": a heavy favorite should prefer the
     safer, lower-variance option even at a slightly lower mean, a heavy
-    underdog the reverse."""
+    underdog the reverse.
+
+    calibration_params (Phase 5), if given, is the (platt_a, platt_b)
+    fitted by `dynasty-agent calibrate-matchup-model`. The brute-force
+    search itself keeps comparing candidates by the raw win probability
+    (cheap, called thousands of times per run); the correction is applied
+    exactly once, to the winning lineup's final reported probability,
+    since Platt scaling with a > 0 is strictly monotonic in the raw
+    probability and therefore never changes which lineup has the highest
+    one. calibration.fit_and_store_calibration flags (does not silently
+    accept) a fitted a <= 0 specifically because that assumption would
+    break here."""
     league_row = conn.execute("SELECT roster_positions_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
     if league_row is None:
         raise ValueError("No league data cached yet. Run `dynasty-agent sync` first.")
@@ -276,6 +295,13 @@ def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: i
             if mean_total > best_points_total:
                 best_points_total, best_points_lineup = mean_total, lineup
 
+    recommended_win_probability = best_prob if best_lineup else None
+    recommended_win_probability_calibrated = (
+        platt_scale(recommended_win_probability, *calibration_params)
+        if calibration_params and recommended_win_probability is not None
+        else None
+    )
+
     return {
         "week": week,
         "unsupported_slots": unsupported_slots,
@@ -284,7 +310,8 @@ def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: i
         "opponent_mean": opponent_mean,
         "opponent_variance": opponent_variance,
         "recommended_lineup": [my_projections[pid] for pid in (best_lineup or [])],
-        "recommended_win_probability": best_prob if best_lineup else None,
+        "recommended_win_probability": recommended_win_probability,
+        "recommended_win_probability_calibrated": recommended_win_probability_calibrated,
         "points_max_lineup": [my_projections[pid] for pid in (best_points_lineup or [])],
         "points_max_total": best_points_total if best_points_lineup else None,
         "differs_from_points_max": bool(best_lineup) and set(best_lineup) != set(best_points_lineup or []),

@@ -49,6 +49,10 @@ FILES = {
     "roster_weekly": ("weekly_rosters", "roster_weekly_{season}.parquet"),
     "depth_charts": ("depth_charts", "depth_charts_{season}.parquet"),
     "pbp": ("pbp", "play_by_play_{season}.parquet"),
+    # Phase 5: real per-week historical injury status, 2009+. Ingested by
+    # nfl_extra.py, listed here (not a second FILES dict) since the
+    # per-season cache-then-DuckDB pattern is identical.
+    "injuries": ("injuries", "injuries_{season}.parquet"),
 }
 
 
@@ -243,13 +247,32 @@ def derive_depth_chart_weekly(conn: sqlite3.Connection, season: int) -> int:
     skill positions this league starts. Where several snapshots fall in the
     same week's prep window, the latest one wins, so each (week, team,
     position, player) row reflects the freshest depth chart available before
-    that week's games. Upserts into depth_chart_weekly, returns row count."""
+    that week's games. Upserts into depth_chart_weekly, returns row count.
+
+    Real, live-verified finding, found backfilling older seasons for Phase
+    5's calibration work (this function had previously only ever run
+    against the current season): nflverse's depth_charts file changed
+    shape at some point, confirmed live across 2012-2024 (one shared older
+    shape: season, club_code, week, position, depth_position, full_name,
+    gsis_id, no dt/pos_abb/pos_rank at all) versus 2025 (the dt/pos_abb/
+    pos_rank shape this function was written against). Reverse-engineering
+    the older week-based format is a real, separate task, out of scope
+    here: this function degrades to 0 rows for a season whose file doesn't
+    have the expected columns, rather than crashing the whole ingest or
+    guessing a mapping. depth_chart_weekly only feeds Phase 2's situation
+    score for CURRENT valuations; Phase 5's calibration work never reads
+    it, so a season with no depth chart rows still backfills real,
+    complete weekly_stats fine."""
 
     depth_path = ensure_cached("depth_charts", season)
     pbp_path = ensure_cached("pbp", season)
 
     con = duckdb.connect()
     try:
+        depth_columns = {d[0] for d in con.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(depth_path)]).description}
+        if not {"dt", "pos_abb", "pos_rank", "team", "player_name"} <= depth_columns:
+            return 0
+
         week_start_rows = con.execute(
             "SELECT week, MIN(game_date) FROM read_parquet(?) GROUP BY week ORDER BY week",
             [str(pbp_path)],

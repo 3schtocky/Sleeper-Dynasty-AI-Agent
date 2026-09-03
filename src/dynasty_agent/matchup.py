@@ -56,6 +56,7 @@ from dynasty_agent.metrics import (
     injury_adjusted_mean,
     injury_adjusted_variance,
     matchup_win_probability,
+    platt_scale,
     sample_mean_variance,
     vegas_week_multiplier,
 )
@@ -82,14 +83,22 @@ def player_weekly_distribution(conn: sqlite3.Connection, player_id: str, season:
     return sample_mean_variance(rows)
 
 
-def team_week_implied_points(season: int, week: int) -> dict[str, float]:
+def team_week_implied_points(season: int, week: int, games_source: str = GAMES_URL) -> dict[str, float]:
     """Vegas-implied points for every team with a scheduled game in a given
     week, derived from real spread_line/total_line in nflverse's free
     schedules file (implied = total/2 +/- spread/2). A team on a bye that
     week is simply absent from the result, not present with a fabricated
-    number. Empty dict if this week's lines aren't published yet."""
+    number. Empty dict if this week's lines aren't published yet.
+
+    games_source defaults to the remote GAMES_URL (fine for this function's
+    normal one-or-two-calls-per-run usage), but accepts a local file path
+    instead. calibration.py passes its own locally cached copy of the same
+    whole-history file: a ~4,000-game backtest needs this for every
+    (season, week) pair, not every game, and re-fetching the whole file
+    over httpfs that many times would be wasteful, not just slow."""
     con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
+    if games_source == GAMES_URL:
+        con.execute("INSTALL httpfs; LOAD httpfs;")
     try:
         rows = con.execute(
             """
@@ -97,7 +106,7 @@ def team_week_implied_points(season: int, week: int) -> dict[str, float]:
             FROM read_parquet(?)
             WHERE season = ? AND week = ? AND spread_line IS NOT NULL AND total_line IS NOT NULL
             """,
-            [GAMES_URL, season, week],
+            [games_source, season, week],
         ).fetchall()
     finally:
         con.close()
@@ -108,14 +117,17 @@ def team_week_implied_points(season: int, week: int) -> dict[str, float]:
     return implied
 
 
-def team_season_avg_implied_points(season: int, before_week: int) -> dict[str, float]:
+def team_season_avg_implied_points(season: int, before_week: int, games_source: str = GAMES_URL) -> dict[str, float]:
     """Each team's average Vegas-implied points across their own completed
     games so far this season, weeks strictly before before_week only, so
     this never uses a future week's line to describe a team's "normal."
     Empty for week 1: there is nothing prior to average yet, and
-    vegas_week_multiplier treats that as a neutral 1.0, not a guess."""
+    vegas_week_multiplier treats that as a neutral 1.0, not a guess.
+
+    See team_week_implied_points' docstring for games_source."""
     con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
+    if games_source == GAMES_URL:
+        con.execute("INSTALL httpfs; LOAD httpfs;")
     try:
         rows = con.execute(
             """
@@ -123,7 +135,7 @@ def team_season_avg_implied_points(season: int, before_week: int) -> dict[str, f
             FROM read_parquet(?)
             WHERE season = ? AND week < ? AND spread_line IS NOT NULL AND total_line IS NOT NULL
             """,
-            [GAMES_URL, season, before_week],
+            [games_source, season, before_week],
         ).fetchall()
     finally:
         con.close()
@@ -195,7 +207,13 @@ def _value_matchup_side(
 
 
 def predict_matchup(
-    conn: sqlite3.Connection, season: int, vegas_season: int, week: int, team_a: list[str], team_b: list[str]
+    conn: sqlite3.Connection,
+    season: int,
+    vegas_season: int,
+    week: int,
+    team_a: list[str],
+    team_b: list[str],
+    calibration_params: tuple[float, float] | None = None,
 ) -> dict:
     """Both sides valued for a specific week, meaned, varied, Vegas-adjusted,
     and turned into a win probability for team_a. Raises ValueError (from
@@ -212,7 +230,16 @@ def predict_matchup(
     CLOSING lines from last year's completed game, so the fallback never
     fired and it silently priced the wrong year's matchups. The caller
     (see cli.py) resolves vegas_season from the actual current NFL season,
-    not a guess."""
+    not a guess.
+
+    calibration_params (Phase 5), if given, is the (platt_a, platt_b) fitted
+    by `dynasty-agent calibrate-matchup-model` (see calibration.py). The
+    caller fetches it, this module never imports calibration.py itself,
+    that direction would be circular (calibration.py already imports
+    player_weekly_distribution from here). None (never run yet) reports
+    only the raw probability, exactly today's behavior; a real value adds
+    win_probability_a_calibrated alongside it, never replacing it, this
+    project's existing auditability rule."""
     week_implied = team_week_implied_points(vegas_season, week)
     season_avg_implied = team_season_avg_implied_points(vegas_season, week)
     week_has_data = bool(week_implied)
@@ -223,6 +250,7 @@ def predict_matchup(
     mean_diff = a["mean"] - b["mean"]
     std_diff = (a["variance"] + b["variance"]) ** 0.5
     win_prob_a = matchup_win_probability(mean_diff, std_diff)
+    win_prob_a_calibrated = platt_scale(win_prob_a, *calibration_params) if calibration_params else None
 
     return {
         "season": season,
@@ -235,4 +263,6 @@ def predict_matchup(
         "std_diff": std_diff,
         "win_probability_a": win_prob_a,
         "win_probability_b": 1.0 - win_prob_a,
+        "win_probability_a_calibrated": win_prob_a_calibrated,
+        "win_probability_b_calibrated": (1.0 - win_prob_a_calibrated) if win_prob_a_calibrated is not None else None,
     }
