@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import calibration, college, config, crosswalk, market, matchup, nfl_extra, nflverse, prospects, sleeper, valuation, weather, weekly
+from dynasty_agent import calibration, college, config, crosswalk, market, matchup, nfl_extra, nflverse, prospects, simulate, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -660,6 +660,74 @@ def cmd_digest(args: argparse.Namespace) -> None:
               "`dynasty-agent calibrate-matchup-model` for a calibrated number (see matchup.py, PLANNING.md).")
 
 
+def cmd_simulate_season(args: argparse.Namespace) -> None:
+    _require_config()
+    conn = get_db()
+
+    stats_season = args.season or _latest_ingested_season(conn)
+    if stats_season is None:
+        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
+        raise SystemExit(1)
+    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+
+    league_row = conn.execute("SELECT settings_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    if league_row is None:
+        print("No league data cached yet. Run `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+    playoff_week_start = json.loads(league_row["settings_json"]).get("playoff_week_start", 15)
+
+    state_row = conn.execute("SELECT week FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    if state_row is None:
+        print("No synced NFL state. Run `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+    from_week = state_row["week"] or 1
+
+    with SleeperClient(conn) as client:
+        for week in range(from_week, playoff_week_start):
+            client.sync_matchups(week)
+
+    calibration_params = calibration.current_calibration(conn)
+    try:
+        result = simulate.simulate_season(
+            conn, stats_season, vegas_season, from_week,
+            n_simulations=args.simulations, seed=args.seed, calibration_params=calibration_params,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    my_roster_row = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
+    my_roster_id = my_roster_row["roster_id"] if my_roster_row else None
+
+    print(
+        f"Season simulation, {result['n_simulations']} runs, from week {result['from_week']} through "
+        f"{result['playoff_week_start'] - 1} ({result['real_matchups_simulated']} real remaining matchups), "
+        f"top {result['playoff_teams']} make the playoffs."
+    )
+    if not result["calibration_used"]:
+        print("No calibration fitted yet, odds below use the raw heuristic. Run `dynasty-agent calibrate-matchup-model` first.")
+    print()
+
+    names = {
+        r["roster_id"]: (r["team_name"] or r["display_name"] or f"Roster {r['roster_id']}")
+        for r in conn.execute(
+            "SELECT r.roster_id, u.team_name, u.display_name FROM rosters r LEFT JOIN users u ON u.user_id = r.owner_id"
+        ).fetchall()
+    }
+
+    header = f"{'Team':<22} {'Record':>8} {'AvgWins':>8} {'PlayoffOdds':>12} {'AvgRank':>8} {'LastOdds':>9}"
+    print(header)
+    print("-" * len(header))
+    for rid, t in sorted(result["teams"].items(), key=lambda kv: -kv[1]["playoff_odds"]):
+        marker = " *" if rid == my_roster_id else "  "
+        name = names.get(rid, f"Roster {rid}")[:20]
+        print(
+            f"{marker}{name:<20} {t['current_wins']:>8} {t['avg_final_wins']:>8.1f} "
+            f"{t['playoff_odds']:>11.1%} {t['avg_final_rank']:>8.1f} {t['last_place_odds']:>8.1%}"
+        )
+    print("\n* = your team")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="dynasty-agent", description="Dynasty fantasy football agent for a Sleeper league."
@@ -845,6 +913,22 @@ def main() -> None:
         help="Season --week's Vegas lines belong to. Defaults to the real current NFL season from the last sync.",
     )
     digest_parser.set_defaults(func=cmd_digest)
+
+    simulate_parser = sub.add_parser(
+        "simulate-season",
+        help="[Phase 6] Monte Carlo simulation of the league's real remaining schedule: playoff odds, "
+        "average final wins/rank, and last-place odds per team, using the calibrated matchup model if fitted.",
+    )
+    simulate_parser.add_argument(
+        "--season", type=int, default=None, help="FPPG/variance baseline season. Defaults to the most recently ingested season."
+    )
+    simulate_parser.add_argument(
+        "--vegas-season", type=int, default=None,
+        help="Vegas lines season for remaining weeks. Defaults to the real current NFL season from the last sync.",
+    )
+    simulate_parser.add_argument("--simulations", type=int, default=10000)
+    simulate_parser.add_argument("--seed", type=int, default=None, help="Fixed seed for reproducible runs.")
+    simulate_parser.set_defaults(func=cmd_simulate_season)
 
     args = parser.parse_args()
     args.func(args)

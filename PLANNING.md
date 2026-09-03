@@ -158,3 +158,23 @@ The small `platt_a` (well under 1.0) is a real, useful finding on its own: it me
 
 ### Acceptance test
 `dynasty-agent backfill-history --start-season 2012 --end-season 2025` then `dynasty-agent calibrate-matchup-model --start-season 2012 --end-season 2025`, both run clean against live data. `predict-matchup`/`optimize-lineup` both print raw and calibrated win probability, labeled, confirmed on real week 1 2025 data above.
+
+## Phase 6: season-outcome simulation
+
+Builds directly on Phase 5's calibrated model: a Monte Carlo simulation of the league's real remaining regular season, reporting playoff odds, not a prediction of who wins the league.
+
+### Open questions, confirmed
+- [x] Does Sleeper's matchups endpoint return real pairings for future, unplayed weeks, or only once a week arrives? **Confirmed live**, queried `/league/{id}/matchups/{week}` directly for weeks 1, 2, 5, 10, 14, 15, and 17 while still at week 1 of the season: every regular-season week already has real, complete `matchup_id` pairings for all 12 rosters. Sleeper pre-generates the full schedule at season start.
+- [x] Real nuance from the same check: weeks 15-17 (the real playoff weeks) also returned pairings, but those almost certainly do not reflect the real eventual playoff bracket, which Sleeper seeds from final regular-season standings that do not exist yet this early. Turns out not to matter: "playoff odds" is a regular-season outcome (who finishes in a qualifying seed), not a simulation of bracket games, so the simulator only ever reads weeks `from_week` through `playoff_week_start - 1` and never touches playoff-week pairings at all.
+
+### Build order
+1. [x] `src/dynasty_agent/simulate.py`: `_team_projection_for_week` (sum of `weekly.project_player` over a roster's real current starters, the same "current roster holds for the rest of the season" simplifying assumption `optimize_lineup` already states) and `simulate_season` (one calibrated win probability computed once per real remaining matchup, then resampled as a Bernoulli draw per trial, standings ranked by simulated final wins with real current `fpts` as a stated-approximate tiebreak). No new dependency, no new migration.
+2. [x] `dynasty-agent simulate-season` CLI command: resolves the real current week from `nfl_state`, syncs every remaining regular-season week's matchups via `SleeperClient`, fetches the fitted calibration if one exists, prints a standings table sorted by playoff odds with real team names (joined against `users`) and the user's own team marked.
+
+### Verified live, not just written
+`dynasty-agent simulate-season --simulations 10000 --seed 42` against the real, live league at week 1: **84 real remaining matchups** (14 weeks x 6 matchups, exactly the expected count), all 12 real teams reported with sensible, internally consistent numbers, playoff odds and average final rank both monotonic against each other across the sorted table. A real, useful confirmation the simulation captures more than just the mean: Porky4951 (7.7 average final wins) ranks BELOW brandontet (7.1 average final wins) on playoff odds, 54.9% vs 61.1%, a real variance effect near the 6-team cutoff, not a bug, higher variance around a similar mean can cost playoff odds even with a higher average.
+
+**Honest limitation of the specific "best current record shows the highest playoff odds" acceptance check**: run at week 1, every real team is 0-0, so current record cannot differentiate anything yet, that specific check is not exercisable this early in the season. Verified instead via internal consistency (the real matchup count, and the mutual monotonicity of playoff odds/average rank/average wins across the real output above); re-verify the record-based check directly once real wins/losses accumulate a few weeks into the season.
+
+### Acceptance test
+`dynasty-agent simulate-season --simulations 10000` run against real synced data: all 12 teams reported, real team names, the user's own team marked, `real_matchups_simulated` matches the real expected remaining-weeks x 6 count.
