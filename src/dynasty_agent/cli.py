@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import config, market, matchup, nflverse, prospects, sleeper, valuation, weather, weekly
+from dynasty_agent import college, config, crosswalk, market, matchup, nflverse, prospects, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -132,6 +132,81 @@ def cmd_ingest_nflverse(args: argparse.Namespace) -> None:
 def cmd_ingest_draft_data(args: argparse.Namespace) -> None:
     conn = get_db()
     print(prospects.ingest_draft_data(conn, force=args.force))
+
+
+def cmd_sync_player_crosswalk(args: argparse.Namespace) -> None:
+    conn = get_db()
+    rows = crosswalk.sync_player_id_crosswalk(conn)
+    print(f"Synced {rows} player id crosswalk rows from dynastyprocess/data.")
+
+
+def cmd_ingest_college_data(args: argparse.Namespace) -> None:
+    conn = get_db()
+    print(college.ingest_college_data(conn, args.start_season, args.end_season, force=args.force))
+
+
+def cmd_prospect_board(args: argparse.Namespace) -> None:
+    conn = get_db()
+
+    # Validated up front, before any board output: a flag this run cannot
+    # honor should fail fast, not after already having printed the board.
+    if args.taxi:
+        _require_config()
+    if args.cross_reference_picks and args.mode != "post-draft":
+        print("Error: --cross-reference-picks needs --mode post-draft, FantasyCalc has no pre-draft rookie pricing.", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        board = prospects.prospect_board(conn, args.draft_year, args.mode, position=args.position, limit=args.limit)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(f"Prospect board, {args.draft_year} draft class, {args.mode} mode.")
+    if args.mode == "pre-draft":
+        print(
+            "Ranked by real 247Sports composite recruiting grade, the most recent ingested recruiting "
+            "class at or before this draft year. Not filtered by declared-for-the-draft status, this "
+            "project has no source for that. College box-score production (dominator rating, breakout "
+            "age) is not computed yet, a confirmed data-source dead end, see college.py.\n"
+        )
+        header = f"{'Player':<24} {'Pos':<4} {'School':<22} {'Class':<7} {'Grade':>6} {'Stars':>6}"
+        print(header)
+        print("-" * len(header))
+        for p in board:
+            grade = f"{p['recruit_grade']:.1f}" if p["recruit_grade"] is not None else "-"
+            stars = str(p["recruit_stars"]) if p["recruit_stars"] is not None else "-"
+            print(
+                f"{p['player_name']:<24} {p['position'] or '':<4} {(p['school'] or '')[:22]:<22} "
+                f"{p['season']:<7} {grade:>6} {stars:>6}"
+            )
+    else:
+        print("Ranked by real draft capital, athletic testing shown alongside.\n")
+        header = f"{'Player':<24} {'Pos':<4} {'College':<18} {'Rnd':>3} {'Pick':>4} {'Team':<5} {'Athl%':>6}"
+        print(header)
+        print("-" * len(header))
+        for p in board:
+            athl = f"{p['athleticism_score']:.0f}" if p["athleticism_score"] is not None else "-"
+            print(
+                f"{p['player_name']:<24} {p['position'] or '':<4} {(p['college'] or '')[:18]:<18} "
+                f"{p['round'] or '':>3} {p['pick'] or '':>4} {p['team'] or '':<5} {athl:>6}"
+            )
+
+    if args.taxi:
+        roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
+        if roster is None:
+            print("\nNo roster found for this user, skipping taxi recommendations.", file=sys.stderr)
+        else:
+            taxi = prospects.taxi_stash_recommendations(conn, roster["roster_id"], args.draft_year)
+            print(f"\nTaxi slots: {taxi['open_taxi_slots']} open.")
+            for r in taxi["taxi_eligible_rostered"]:
+                print(f"  {r['full_name']:<24} {r['position'] or ''}")
+
+    if args.cross_reference_picks:
+        for round_num in (1, 2, 3):
+            xref = prospects.prospect_pick_cross_reference(conn, args.draft_year, round_num, discount_rate=0.20)
+            model_str = f"{xref['pick_value_estimate']['model_value']:.0f}" if xref["pick_value_estimate"]["model_value"] is not None else "-"
+            print(f"\n{args.draft_year} round {round_num}: model value {model_str}, top available {xref['top_available_at_round'] or '-'}")
 
 
 def _latest_ingested_season(conn) -> int | None:
@@ -564,6 +639,42 @@ def main() -> None:
         "--force", action="store_true", help="Re-download even if already cached, to pick up nflverse's latest update."
     )
     ingest_draft_parser.set_defaults(func=cmd_ingest_draft_data)
+
+    sub.add_parser(
+        "sync-player-crosswalk",
+        help="[Phase 4] Sync the player id crosswalk (Sleeper/gsis/pfr/cfbref/espn/yahoo ids) from dynastyprocess/data.",
+    ).set_defaults(func=cmd_sync_player_crosswalk)
+
+    ingest_college_parser = sub.add_parser(
+        "ingest-college-data",
+        help="[Phase 4] Cache and derive college recruiting, team talent, returning production, and player "
+        "production (dominator rating) for a range of college football seasons.",
+    )
+    ingest_college_parser.add_argument("--start-season", type=int, required=True)
+    ingest_college_parser.add_argument("--end-season", type=int, required=True)
+    ingest_college_parser.add_argument(
+        "--force", action="store_true", help="Re-download even if already cached."
+    )
+    ingest_college_parser.set_defaults(func=cmd_ingest_college_data)
+
+    prospect_board_parser = sub.add_parser(
+        "prospect-board",
+        help="[Phase 4] A ranked rookie prospect board: real draft capital and athletic testing "
+        "(post-draft mode) or college production and recruiting pedigree (pre-draft mode).",
+    )
+    prospect_board_parser.add_argument("--draft-year", type=int, required=True)
+    prospect_board_parser.add_argument("--mode", choices=["pre-draft", "post-draft"], required=True)
+    prospect_board_parser.add_argument("--position", default=None, help="Filter to one position, e.g. WR.")
+    prospect_board_parser.add_argument("--limit", type=int, default=20)
+    prospect_board_parser.add_argument(
+        "--taxi", action="store_true", help="Also show open taxi slots and how your taxi-eligible rookies rank."
+    )
+    prospect_board_parser.add_argument(
+        "--cross-reference-picks", action="store_true",
+        help="Also show each round's FantasyCalc-anchored pick value against the top available name at that round. "
+        "post-draft mode only.",
+    )
+    prospect_board_parser.set_defaults(func=cmd_prospect_board)
 
     valuate_parser = sub.add_parser(
         "valuate",

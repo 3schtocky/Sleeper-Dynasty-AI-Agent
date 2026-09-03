@@ -17,9 +17,12 @@ It is built for **one specific league shape**: 12 teams, 1QB, full PPR, no TE pr
 - **`optimize-lineup`** — the starting lineup, out of your real roster, that maximizes win probability against your actual Sleeper opponent for a given week, not raw projected points. Reports the highest-raw-points lineup alongside for comparison, since they can differ.
 - **`faab`** — a sized FAAB bid for one waiver target, against your real remaining budget, real weeks left before the playoffs, and how that target's real win-now value compares to everyone else actually available right now.
 - **`digest`** — the weekly brief: recommended lineup and win probability, real wind flags for your starters' games, top bench options, and sized suggestions for the best available waiver targets, all in one command.
-- **`ingest-draft-data`** *(Phase 4, in progress)* — caches real NFL draft picks and combine testing results (nflverse's `draft_picks`/`combine`, whole-history files). Data layer only; there's no ranked prospect board command yet.
+- **`ingest-draft-data`** — caches real NFL draft picks and combine testing results (nflverse's `draft_picks`/`combine`, whole-history files).
+- **`ingest-college-data`** — caches real recruiting pedigree, team talent, and returning production for a range of college football seasons ([sportsdataverse](https://github.com/sportsdataverse/sportsdataverse-data), no key needed).
+- **`sync-player-crosswalk`** — syncs a player ID crosswalk (Sleeper/gsis/pfr/espn/yahoo IDs) from [dynastyprocess/data](https://github.com/dynastyprocess/data), fetched live, never vendored.
+- **`prospect-board`** — a ranked rookie prospect board. Post-draft mode: real draft capital and athletic testing. Pre-draft mode: real recruiting grade. `--taxi` shows your open taxi slots and how your taxi-eligible rookies rank; `--cross-reference-picks` shows a buy/hold/sell read on your owned future picks (post-draft mode only).
 
-What it doesn't do yet: a ranked rookie prospect board. `ingest-draft-data` above is the first piece. The rest is blocked on two things: draft capital, landing spot, and athletic testing don't exist yet for this league's actual next rookie class (the 2027 NFL draft hasn't happened; confirmed live against nflverse's own data), and college production (dominator rating, breakout age) has no confirmed source: the College Football Data API was considered and rejected, it requires registering with an email. No keyless, free, structured source for real college production stats has been confirmed yet, that's an open question, not solved by picking a fallback silently. See `PLANNING.md` for the full detail.
+College box-score production (dominator rating, breakout age) has no working data source yet. The College Football Data API was considered and rejected, it requires registering with an email; the keyless alternative tried since, a per-game college boxscore file, turned out to have no stable team identifier at all, confirmed live. That's a real open question, not solved by a guessed team match. See `PLANNING.md` for the full detail.
 
 ## Requirements
 
@@ -60,7 +63,9 @@ uv run dynasty-agent sync                          # your league, rosters, and m
 uv run dynasty-agent roster                         # sanity check: is this your team?
 uv run dynasty-agent ingest-nflverse --season 2025  # the most recently completed NFL season
 uv run dynasty-agent valuate                        # win-now/three-year value + the verdict
-uv run dynasty-agent ingest-draft-data               # Phase 4 data layer: real NFL draft picks + combine
+uv run dynasty-agent ingest-draft-data               # real NFL draft picks + combine
+uv run dynasty-agent ingest-college-data --start-season 2022 --end-season 2025  # real recruiting pedigree
+uv run dynasty-agent prospect-board --draft-year 2026 --mode post-draft  # ranked rookie prospect board
 ```
 
 Evaluate a trade, players by name (fuzzy-matched) or Sleeper `player_id`, picks as `<season>-<round>`:
@@ -124,7 +129,7 @@ Every one of these is a plain, readable function in `src/dynasty_agent/metrics.p
 ## Project layout
 
 ```
-src/dynasty_agent/   the CLI and every module (sleeper, nflverse, market, metrics, valuation)
+src/dynasty_agent/   the CLI and every module (sleeper, nflverse, college, crosswalk, market, metrics, valuation)
 migrations/          the SQLite schema, one file per migration, applied automatically
 tests/                unit tests for the metric calculations
 CLAUDE.md             environment, league settings, strategic reasoning, and working rules

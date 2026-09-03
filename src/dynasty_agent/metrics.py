@@ -287,3 +287,99 @@ def matchup_win_probability(mean_diff: float, std_diff: float) -> float:
             return 0.0
         return 0.5
     return normal_cdf(mean_diff / std_diff)
+
+
+# -- Phase 4: college production and athletic testing -------------------------
+#
+# The standard dynasty-analysis "Dominator Rating" formula: the average of a
+# player's share of team yards and share of team touchdowns. Combination
+# (rushing+receiving for a RB, receiving-only for a WR/TE) is decided by the
+# caller (college.py), not here, so this stays a generic, position-agnostic
+# share calculation, the same separation of concerns production_score keeps
+# from win_now_value.
+
+# The standard breakout-age threshold in public dynasty analysis: the college
+# season a player first crosses a 20% (of team offense) dominator rating. A
+# round, commonly used number, not fitted from outcome data, the same
+# honesty standard as INJURY_MEAN_MULTIPLIER.
+DOMINATOR_BREAKOUT_THRESHOLD = 20.0  # on dominator_rating's own 0-100 scale
+
+
+def dominator_rating(
+    player_yards: float | None, player_tds: float | None, team_yards: float | None, team_tds: float | None
+) -> float | None:
+    """0-100. None when a team total is missing or zero, never a guessed 0:
+    a 0 here would read as "this player produced nothing," when the real
+    meaning is "this team has no recorded production to share."""
+    if not team_yards or not team_tds:
+        return None
+    yards_share = (player_yards or 0) / team_yards
+    td_share = (player_tds or 0) / team_tds
+    return 100.0 * (yards_share + td_share) / 2.0
+
+
+def age_in_college_season(draft_age: int | None, draft_season: int, college_season: int) -> float | None:
+    """Approximate age during a given college season, backed into from a
+    player's real, sourced age at the actual NFL draft (nfl_draft_picks.age,
+    from PFR), not a birthdate this project does not reliably have.
+    Approximate: off by up to roughly a year at draft-day-versus-birth-month
+    edges, since draft_age is a snapshot at the following April's draft, not
+    at the college season's own start. Stated here, not hidden. None if
+    draft_age is unknown."""
+    if draft_age is None:
+        return None
+    return draft_age - (draft_season - college_season)
+
+
+def breakout_age(
+    seasons: list[tuple[int, float | None]],
+    draft_age: int | None,
+    draft_season: int,
+    threshold: float = DOMINATOR_BREAKOUT_THRESHOLD,
+) -> float | None:
+    """Age at the first real college season with dominator_rating at or
+    above threshold, from real chronological (college_season,
+    dominator_rating) pairs. None if draft_age is unknown or no season ever
+    hit the threshold, never a guessed age."""
+    if draft_age is None:
+        return None
+    for college_season, rating in sorted(seasons):
+        if rating is not None and rating >= threshold:
+            return age_in_college_season(draft_age, draft_season, college_season)
+    return None
+
+
+# Combine drills that actually matter per position, in the dynasty-analysis
+# sense: QB is deliberately excluded, no combine drill meaningfully predicts
+# fantasy QB value. forty/cone/shuttle are lower-is-better times; vertical/
+# broad_jump/bench are higher-is-better, handled in athleticism_score below.
+COMBINE_METRICS_BY_POSITION: dict[str, tuple[str, ...]] = {
+    "WR": ("forty", "vertical", "broad_jump"),
+    "RB": ("forty", "vertical", "broad_jump", "bench"),
+    "TE": ("forty", "vertical", "broad_jump"),
+}
+_LOWER_IS_BETTER_DRILLS = {"forty", "cone", "shuttle"}
+
+
+def athleticism_score(position: str, player_metrics: dict, population: dict[str, list[float | None]]) -> float:
+    """Average percentile rank across the position's relevant combine
+    drills, against the real nfl_combine population at that position
+    (lower-is-better drills inverted first). Neutral 50.0 if the position
+    has no defined drills (QB) or none of them were actually tested for
+    this player, the same neutral-midpoint convention percentile_rank
+    itself already uses for missing data."""
+    drills = COMBINE_METRICS_BY_POSITION.get(position, ())
+    if not drills:
+        return 50.0
+    scores = []
+    for drill in drills:
+        value = player_metrics.get(drill)
+        if value is None:
+            continue
+        pct = percentile_rank(value, population.get(drill, []))
+        if drill in _LOWER_IS_BETTER_DRILLS:
+            pct = 100.0 - pct
+        scores.append(pct)
+    if not scores:
+        return 50.0
+    return sum(scores) / len(scores)

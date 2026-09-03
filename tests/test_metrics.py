@@ -1,9 +1,13 @@
 from datetime import date
 
 from dynasty_agent.metrics import (
+    age_in_college_season,
     age_multiplier,
+    athleticism_score,
+    breakout_age,
     compute_fantasy_points,
     discounted_pick_value,
+    dominator_rating,
     injury_adjusted_mean,
     injury_adjusted_variance,
     map_snapshot_to_week,
@@ -324,3 +328,86 @@ def test_vegas_week_multiplier_is_neutral_without_a_published_line():
 
 def test_vegas_week_multiplier_is_neutral_with_neither_input():
     assert vegas_week_multiplier(None, None) == 1.0
+
+
+# -- Phase 4: college production and athletic testing ----------------------------
+
+
+def test_dominator_rating_basic():
+    # 400/1000 yards = 40% share, 4/10 tds = 40% share -> 40.0
+    assert dominator_rating(400.0, 4, 1000.0, 10) == 40.0
+
+
+def test_dominator_rating_averages_yards_and_td_share_separately():
+    # 20% yards share, 60% td share -> (20 + 60) / 2 = 40.0
+    assert dominator_rating(200.0, 6, 1000.0, 10) == 40.0
+
+
+def test_dominator_rating_none_on_zero_team_yards():
+    assert dominator_rating(100.0, 1, 0.0, 10) is None
+
+
+def test_dominator_rating_none_on_zero_team_tds():
+    assert dominator_rating(100.0, 1, 1000.0, 0) is None
+
+
+def test_dominator_rating_none_on_missing_team_totals():
+    assert dominator_rating(100.0, 1, None, None) is None
+
+
+def test_dominator_rating_treats_missing_player_stats_as_zero():
+    assert dominator_rating(None, None, 1000.0, 10) == 0.0
+
+
+def test_age_in_college_season_backs_into_age_from_draft_age():
+    # drafted at age 22 in 2026; the 2024 college season was 2 years earlier -> 20
+    assert age_in_college_season(22, 2026, 2024) == 20
+
+
+def test_age_in_college_season_none_without_a_real_draft_age():
+    assert age_in_college_season(None, 2026, 2024) is None
+
+
+def test_breakout_age_finds_first_qualifying_season():
+    seasons = [(2022, 10.0), (2023, 25.0), (2024, 40.0)]
+    # first season >= the 20.0 threshold is 2023, three years before the 2026 draft, age 22 - 3 = 19
+    assert breakout_age(seasons, draft_age=22, draft_season=2026) == 19
+
+
+def test_breakout_age_none_when_never_hits_threshold():
+    seasons = [(2022, 5.0), (2023, 10.0)]
+    assert breakout_age(seasons, draft_age=22, draft_season=2026) is None
+
+
+def test_breakout_age_none_without_a_real_draft_age():
+    seasons = [(2022, 40.0)]
+    assert breakout_age(seasons, draft_age=None, draft_season=2026) is None
+
+
+def test_breakout_age_ignores_seasons_with_no_recorded_rating():
+    seasons = [(2022, None), (2023, 30.0)]
+    # 2022 has no recorded rating, skipped; 2023 qualifies, three years before the 2026 draft, age 22 - 3 = 19
+    assert breakout_age(seasons, draft_age=22, draft_season=2026) == 19
+
+
+def test_athleticism_score_neutral_when_position_has_no_defined_drills():
+    assert athleticism_score("QB", {"forty": 4.5}, {}) == 50.0
+
+
+def test_athleticism_score_neutral_when_no_drills_were_tested():
+    assert athleticism_score("WR", {}, {"forty": [4.4, 4.5, 4.6]}) == 50.0
+
+
+def test_athleticism_score_inverts_lower_is_better_drills():
+    # faster than every other player in the population (a raw percentile_rank
+    # of 0.0, since a lower time ranks last on the raw, un-inverted scale) should
+    # score 100, not 0, once inverted.
+    population = {"forty": [4.5, 4.6, 4.7]}
+    assert athleticism_score("RB", {"forty": 4.3}, population) == 100.0
+
+
+def test_athleticism_score_averages_across_available_drills():
+    population = {"forty": [4.5, 4.6, 4.7], "vertical": [30.0, 32.0, 34.0]}
+    # forty 4.3 beats the whole population (inverted percentile 100), vertical
+    # 32.0 ties the population's own middle value (raw percentile 50, not inverted)
+    assert athleticism_score("WR", {"forty": 4.3, "vertical": 32.0}, population) == 75.0
