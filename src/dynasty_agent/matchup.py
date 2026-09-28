@@ -52,6 +52,7 @@ import sqlite3
 
 import duckdb
 
+from dynasty_agent import nflverse
 from dynasty_agent.metrics import (
     injury_adjusted_mean,
     injury_adjusted_variance,
@@ -60,9 +61,6 @@ from dynasty_agent.metrics import (
     vegas_week_multiplier,
 )
 from dynasty_agent.valuation import resolve_player, to_nflverse_team
-
-GAMES_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.parquet"
-
 
 def player_weekly_distribution(conn: sqlite3.Connection, player_id: str, season: int) -> tuple[float, float | None, int]:
     """A player's mean and unbiased sample variance (see
@@ -88,8 +86,8 @@ def team_week_implied_points(season: int, week: int) -> dict[str, float]:
     schedules file (implied = total/2 +/- spread/2). A team on a bye that
     week is simply absent from the result, not present with a fabricated
     number. Empty dict if this week's lines aren't published yet."""
+    games_path = str(nflverse.ensure_games_cached())
     con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
     try:
         rows = con.execute(
             """
@@ -97,7 +95,7 @@ def team_week_implied_points(season: int, week: int) -> dict[str, float]:
             FROM read_parquet(?)
             WHERE season = ? AND week = ? AND spread_line IS NOT NULL AND total_line IS NOT NULL
             """,
-            [GAMES_URL, season, week],
+            [games_path, season, week],
         ).fetchall()
     finally:
         con.close()
@@ -114,8 +112,8 @@ def team_season_avg_implied_points(season: int, before_week: int) -> dict[str, f
     this never uses a future week's line to describe a team's "normal."
     Empty for week 1: there is nothing prior to average yet, and
     vegas_week_multiplier treats that as a neutral 1.0, not a guess."""
+    games_path = str(nflverse.ensure_games_cached())
     con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
     try:
         rows = con.execute(
             """
@@ -123,7 +121,7 @@ def team_season_avg_implied_points(season: int, before_week: int) -> dict[str, f
             FROM read_parquet(?)
             WHERE season = ? AND week < ? AND spread_line IS NOT NULL AND total_line IS NOT NULL
             """,
-            [GAMES_URL, season, before_week],
+            [games_path, season, before_week],
         ).fetchall()
     finally:
         con.close()

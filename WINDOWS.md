@@ -126,7 +126,7 @@ New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
 
 then restart.
 
-**`ingest-nflverse` or `predict-matchup` fails to reach `github.com` or hangs on the first DuckDB query.** DuckDB installs a small extension (`httpfs`) the first time it needs to read a remote file, and on a locked-down corporate network or VPN that blocks outbound connections to unfamiliar hosts, that download (or the actual nflverse data fetch) can get blocked. Check whether a proxy or firewall is intercepting `github.com` and `objects.githubusercontent.com`; this isn't a Windows-specific issue, it'd behave the same way on any OS behind the same network policy.
+**`ingest-nflverse` or `predict-matchup` fails to reach `github.com` or hangs on the first DuckDB query.** Every nflverse file, the schedules file included, downloads through `httpx` into `data/nflverse/` before DuckDB reads it locally, and on a locked-down corporate network or VPN that blocks outbound connections to unfamiliar hosts, that download can get blocked. Check whether a proxy or firewall is intercepting `github.com` and `objects.githubusercontent.com`; this isn't a Windows-specific issue, it'd behave the same way on any OS behind the same network policy.
 
 **Everything works but output looks like `Ã¢â‚¬â€` instead of normal punctuation.** That's a console codepage issue, an old `cmd.exe` window not set to UTF-8. Switch to PowerShell (this guide assumes PowerShell throughout, not `cmd.exe`) or, if you must use `cmd.exe`, run `chcp 65001` first to switch its codepage to UTF-8.
 

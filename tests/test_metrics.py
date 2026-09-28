@@ -324,3 +324,27 @@ def test_vegas_week_multiplier_is_neutral_without_a_published_line():
 
 def test_vegas_week_multiplier_is_neutral_with_neither_input():
     assert vegas_week_multiplier(None, None) == 1.0
+
+
+# -- best possible lineup ----------------------------------------------------------
+
+from dynasty_agent.metrics import best_lineup_total  # noqa: E402
+
+ONE_FLEX = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1}
+
+
+def test_best_lineup_total_fills_dedicated_slots_then_flex():
+    players = [("QB", 20), ("QB", 18), ("RB", 15), ("RB", 12), ("RB", 10),
+               ("WR", 14), ("WR", 13), ("WR", 11), ("WR", 9), ("TE", 7)]
+    # QB 20, RB 15+12, WR 14+13+11, TE 7, FLEX best of RB 10 / WR 9 = 10. The backup QB can't flex.
+    assert best_lineup_total(players, ONE_FLEX) == 20 + 15 + 12 + 14 + 13 + 11 + 7 + 10
+
+
+def test_best_lineup_total_superflex_takes_a_second_qb():
+    players = [("QB", 20), ("QB", 18), ("RB", 5), ("WR", 4)]
+    assert best_lineup_total(players, {"QB": 1, "SUPER_FLEX": 1}) == 38
+
+
+def test_best_lineup_total_leaves_unfillable_slots_at_zero():
+    assert best_lineup_total([("QB", 20)], ONE_FLEX) == 20
+    assert best_lineup_total([], ONE_FLEX) == 0

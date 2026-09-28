@@ -59,6 +59,33 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 ### Acceptance test
 `dynasty-agent digest` for a real week, producing a lineup recommendation and FAAB suggestions with inputs shown. Ran clean against real Week 1 2026 data.
 
+## Phase 3.5: full audit, before Phase 4
+
+A full read of every module plus live checks against the real data files, done before building Phase 4 on top of this code. Each fix below has a test in `tests/test_integration.py` or `tests/test_metrics.py` (76 tests passing, up from 58; an earlier line in this file said 55, that count was already stale).
+
+### Real bugs found and fixed
+- **Rams wind flags never fired.** `digest` passed Sleeper's `LAR` to `weather.game_wind_forecast`, whose schedule lookup uses nflverse's `LA`, so every Rams game read as a bye. The third time this exact team-code bug shape turned up. Fixed inside `game_wind_forecast` with `valuation.to_nflverse_team`. Verified live: the Rams' real Week 4 2026 game at Lincoln Financial Field now returns a real NWS forecast (5 mph).
+- **Lineup optimizer picked an arbitrary lineup whenever win probability tied.** With no opponent set, or an edge big enough that the normal CDF rounds to exactly 1.0, every lineup scores the same probability and the first one reached won, starting a 4-point RB over a 9-point WR in the flex. Found by the new integration test, not by inspection. Ties now break on projected points.
+- **nflverse cache never refreshed an in-progress season.** `ensure_cached` returned any file already on disk, so ingesting 2026 mid-season froze its stats at the first download. `ingest-nflverse` now re-downloads automatically when `--season` is the current NFL season, and `--force` does it for any season.
+- **Interrupted downloads were cached as valid forever.** Downloads wrote straight to the final path. `nflverse.download` now writes a `.part` file and renames it only once complete; `prospects.py` reuses it.
+- **Pick valuation would have broken after the 2027 rookie draft.** `PICK_VALUE_BASE_SEASON = 2027` was hardcoded. Once FantasyCalc stops listing "2027 1st", every pick's model value would have gone to None and counted as 0 in the trade market total. The base season is now the earliest season FantasyCalc actually prices (`market.priced_pick_seasons`, read live, verified against the real response: 2027 through 2029, plus Early/Mid/Late tiers for 2027 that are correctly not mistaken for seasons). Anything still unpriced is named in `trade` output instead of a silent 0.
+- **Combine ingest dropped every row with no `pfr_id`**: 1,531 of 8,968 real rows (54 of 319 in 2026). All undrafted today, however a pre-draft combine row has no PFR NFL page yet either, so the 2027 class's testing, the one real input that exists before its draft, would have been dropped. Migration `0004_combine_surrogate_key.sql` keys the table on `prospects.combine_row_id` (pfr, else cfb, else name and school), and ingestion replaces the table each run so a row gaining a `pfr_id` once drafted leaves no stale duplicate. Verified live: 8,965 rows land (up from 7,434), the 3 known duplicate `pfr_id` pairs collapsing as before, 1,531 of them with no `pfr_id`.
+- **Contend-or-rebuild measured lineup-setting, not rosters.** It summed whatever starters each manager last set in Sleeper: empty or stale all offseason, wrong for any manager who hadn't set one. Each team is now scored on the best lineup it could start (`metrics.best_lineup_total`, starters plus bench, the league's own `roster_positions`).
+- **FAAB budget was hardcoded to $100.** Now read from the league's `waiver_budget`; Sleeper's default is used and reported as a default only when the setting is absent.
+- **Retired and unsigned players counted as FAAB targets.** Valuations come from last season's stats, so anyone who retired read as an available free agent, inflating the percentile pool and able to top `digest`'s target list. The pool is now limited to players on an NFL team today.
+- **Situation score mixed postseason plays into two of its three inputs** (pass rate over expected, sack rate), while QB EPA was regular season only. All three are regular season now.
+- **`drafts`/`draft_picks` were never populated** and `DRAFT_ID` was never read. `sync` now pulls every league draft and its picks (`SleeperClient.sync_drafts`), needed for Phase 4's draft order.
+- **League renewal wasn't handled.** Sleeper gives a renewed dynasty league a new `league_id` each season; a `.env` from 2026 would keep syncing the 2026 league through the 2027 rookie draft. `sync` now checks for a renewed league (`sleeper.find_successor_league`, matched on `previous_league_id`) and prints the `init` command to switch; it never rewrites `.env` on its own. `init --league-id` now also searches next season's leagues, since Sleeper creates the renewal months before its own season rolls over.
+
+### Hardening, no live bug found
+- The `roster_weekly` crosswalk is grouped to one row per player-week. Checked live, 2025 has no duplicate; a `SELECT DISTINCT` would have written a player's week twice under two keys if a future file ever listed him with and without a `sleeper_id`.
+- The schedules file is cached locally (6-hour max age, lines move all week) instead of read over HTTP on every call, several times per player in `digest`.
+- `weekly_stats.is_estimated` is 1 on every row, on purpose: it marks `yards_per_route_run` as always the snaps-based estimate. Documented at the write site.
+
+### Still open, flagged not fixed
+- Every player with no NFL stats, the whole rostered 2026 rookie class included, is valued at 0 win-now and 0 three-year. That skews `valuate`'s verdict and `trade`'s three-year numbers. Fixing it needs the prospect model, so it is Phase 4 step 6 below, not a patch here.
+- Not yet re-verified end to end against the real league: this audit ran on a fresh clone with no `.env`. `sync`, `valuate`, `trade` and `digest` need one live run each.
+
 ## Phase 4: rookie draft prep
 
 **Same constraint as Phase 3: quantitative first.** The prospect board ranks on quantifiable inputs, draft capital, college production metrics (dominator rating), breakout age, athletic testing, with stated weights per position matching this league's actual scoring, not subjective scouting takes. Where a number can be sourced and computed, it gets computed; sentiment-only inputs stay explicitly labeled as such and never substitute for a real underlying stat, the same standard Phase 2 already set with win-now/three-year value and the trade evaluator's arbitrage math.

@@ -8,7 +8,7 @@ It is built for **one specific league shape**: 12 teams, 1QB, full PPR, no TE pr
 
 ## What it does today
 
-- **`sync`** — pulls your league, all rosters, users, traded picks, current NFL week, and FantasyCalc dynasty values.
+- **`sync`** — pulls your league, all rosters, users, traded picks, your league's drafts and their picks, current NFL week, and FantasyCalc dynasty values. Sleeper gives a renewed dynasty league a new league ID every season; when yours has been renewed, `sync` says so and prints the `init` command that switches to it.
 - **`roster`** — your current roster with age, team, market value, and 30-day value trend.
 - **`ingest-nflverse`** — derives per-player-per-week target share, air yards share, WOPR, weighted opportunity, red zone touches, team pass rate over expected, and fantasy points computed from *your* league's actual scoring settings, not a generic PPR assumption.
 - **`valuate`** — win-now value and three-year value per player (kept separate, never blended into one number), plus a contend-or-rebuild verdict with its confidence stated, not implied.
@@ -59,6 +59,7 @@ If your league isn't 12-team/1QB/full-PPR, also set the `FANTASYCALC_NUM_QBS` / 
 uv run dynasty-agent sync                          # your league, rosters, and market values
 uv run dynasty-agent roster                         # sanity check: is this your team?
 uv run dynasty-agent ingest-nflverse --season 2025  # the most recently completed NFL season
+                                                    # the current season re-downloads automatically to pick up new weeks; --force does it for any season
 uv run dynasty-agent valuate                        # win-now/three-year value + the verdict
 uv run dynasty-agent ingest-draft-data               # Phase 4 data layer: real NFL draft picks + combine
 ```

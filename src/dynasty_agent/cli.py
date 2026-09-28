@@ -30,17 +30,25 @@ def cmd_init(args: argparse.Namespace) -> None:
         raise SystemExit(1)
     user_id = user["user_id"]
 
-    season = current_season = sleeper.current_nfl_season()
+    season = sleeper.current_nfl_season()
     leagues = sleeper.list_leagues_for_season(user_id, season)
-    if not leagues:
-        print(f"'{args.username}' has no {season} NFL leagues on Sleeper.", file=sys.stderr)
-        raise SystemExit(1)
 
     if args.league_id:
-        league = next((league for league in leagues if league["league_id"] == args.league_id), None)
+        # A renewed league belongs to next season, and Sleeper creates it
+        # months before its own current season rolls over, so an explicit
+        # --league-id (what `sync`'s renewal notice suggests) searches both.
+        next_season = str(int(season) + 1)
+        candidates = leagues + sleeper.list_leagues_for_season(user_id, next_season)
+        league = next((league for league in candidates if league["league_id"] == args.league_id), None)
         if league is None:
-            print(f"'{args.username}' is not in a {season} league with id {args.league_id}.", file=sys.stderr)
+            print(
+                f"'{args.username}' is not in a {season} or {next_season} league with id {args.league_id}.",
+                file=sys.stderr,
+            )
             raise SystemExit(1)
+    elif not leagues:
+        print(f"'{args.username}' has no {season} NFL leagues on Sleeper.", file=sys.stderr)
+        raise SystemExit(1)
     elif len(leagues) == 1:
         league = leagues[0]
     else:
@@ -60,7 +68,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         encoding="utf-8",
     )
     print(f"Wrote {config.ENV_PATH}")
-    print(f"League: {league['name']} ({league['league_id']}, {current_season} season)")
+    print(f"League: {league['name']} ({league['league_id']}, {league.get('season') or season} season)")
     print("Next: `dynasty-agent sync`")
 
 
@@ -70,7 +78,19 @@ def cmd_sync(args: argparse.Namespace) -> None:
     with SleeperClient(conn) as client:
         client.sync_all()
     market.sync_market_values(conn)
-    print("Synced players, league, users, rosters, traded picks, nfl state, and market values.")
+    print("Synced players, league, users, rosters, traded picks, drafts, nfl state, and market values.")
+
+    league_row = conn.execute("SELECT season FROM league WHERE league_id = ?", (config.LEAGUE_ID,)).fetchone()
+    if league_row is not None and league_row["season"]:
+        successor = sleeper.find_successor_league(config.SLEEPER_USER_ID, config.LEAGUE_ID, league_row["season"])
+        if successor is not None:
+            print(
+                f"\nNOTICE: this league has been renewed for {successor['season']} under a new league_id, "
+                f"{successor['league_id']}. Everything above synced the {league_row['season']} league. "
+                f"Run `dynasty-agent init --username {config.SLEEPER_USERNAME} --league-id {successor['league_id']}` "
+                f"to switch to it.",
+                file=sys.stderr,
+            )
 
 
 def cmd_roster(args: argparse.Namespace) -> None:
@@ -126,7 +146,14 @@ def cmd_ingest_nflverse(args: argparse.Namespace) -> None:
         print("No league data cached yet. Run `dynasty-agent sync` first.", file=sys.stderr)
         raise SystemExit(1)
     scoring_settings = json.loads(league["scoring_settings_json"])
-    print(nflverse.ingest_season(conn, args.season, scoring_settings))
+    # The current NFL season is still gaining weeks, so its cached files are
+    # always re-downloaded; a completed season's files never change.
+    state_row = conn.execute("SELECT season FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    is_current_season = state_row is not None and state_row["season"] is not None and int(state_row["season"]) == args.season
+    force = args.force or is_current_season
+    if is_current_season and not args.force:
+        print(f"{args.season} is the current NFL season, re-downloading its files to pick up new weeks.")
+    print(nflverse.ingest_season(conn, args.season, scoring_settings, force=force))
 
 
 def cmd_ingest_draft_data(args: argparse.Namespace) -> None:
@@ -277,6 +304,8 @@ def cmd_trade(args: argparse.Namespace) -> None:
             f"3yr mine (players only) {side['player_three_year_total']:.1f}, "
             f"market value (players + picks, comparable) {side['market_value_total']:.0f}"
         )
+        if side["unpriced"]:
+            print(f"  WARNING: no market price for {', '.join(side['unpriced'])}, counted as 0 in the market total above.")
 
     print(f"Trade evaluation, {season} season basis, pick discount rate {args.discount_rate:.0%} per year.")
     print(
@@ -459,7 +488,11 @@ def cmd_faab(args: argparse.Namespace) -> None:
     print(f"FAAB recommendation for {result['player']} ({result['position']})")
     if result["is_rostered"]:
         print("Warning: this player is already on a roster in your league, not actually a free agent right now.")
-    print(f"\nRemaining budget: ${result['remaining_budget']}, {result['weeks_left']} weeks left before the playoffs.")
+    budget_note = " (league settings carry no waiver_budget, assumed Sleeper's default)" if result["budget_is_default"] else ""
+    print(
+        f"\nRemaining budget: ${result['remaining_budget']} of ${result['total_budget']}{budget_note}, "
+        f"{result['weeks_left']} weeks left before the playoffs."
+    )
     print(
         f"Win-now value: {result['target_win_now_value']:.1f} "
         f"({result['percentile_among_available']:.0f}th percentile among players actually available on waivers, "
@@ -553,6 +586,10 @@ def main() -> None:
         "ingest-nflverse", help="Cache nflverse files and derive weekly player metrics for a season."
     )
     ingest_parser.add_argument("--season", type=int, required=True)
+    ingest_parser.add_argument(
+        "--force", action="store_true",
+        help="Re-download this season's files even if cached. Automatic for the current NFL season.",
+    )
     ingest_parser.set_defaults(func=cmd_ingest_nflverse)
 
     ingest_draft_parser = sub.add_parser(

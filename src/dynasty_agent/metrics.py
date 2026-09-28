@@ -154,6 +154,58 @@ def three_year_value(production: float, position: str | None, age: float | None,
     return production * three_year_age_factor(position, age) * situation_multiplier(situation_score_0_100)
 
 
+# -- lineup slots ---------------------------------------------------------------
+
+NON_STARTING_SLOTS = ("BN", "TAXI", "IR")
+
+# Sleeper's flex slot types and which positions each one accepts, filled
+# narrowest first by best_lineup_total.
+FLEX_SLOT_ELIGIBILITY: dict[str, tuple[str, ...]] = {
+    "REC_FLEX": ("WR", "TE"),
+    "WRRB_FLEX": ("RB", "WR"),
+    "FLEX": ("RB", "WR", "TE"),
+    "SUPER_FLEX": ("QB", "RB", "WR", "TE"),
+}
+
+
+def starting_slot_counts(roster_positions: list[str]) -> dict[str, int]:
+    """How many of each real starting slot a league uses, bench/taxi/IR
+    excluded, read from the league's own roster_positions rather than
+    hardcoded, so this stays correct against a differently shaped league."""
+    counts: dict[str, int] = {}
+    for slot in roster_positions:
+        if slot in NON_STARTING_SLOTS:
+            continue
+        counts[slot] = counts.get(slot, 0) + 1
+    return counts
+
+
+def best_lineup_total(players: list[tuple[str | None, float]], slot_counts: dict[str, int]) -> float:
+    """Highest total value a roster can start, given (position, value) per
+    player and the league's starting slot counts. Dedicated slots take each
+    position's best players, then flex slots take the best of what's left,
+    narrowest eligibility first. Exact for this league's shape (one FLEX,
+    one SUPER_FLEX, or both), since each wider slot's eligible set contains
+    the narrower one's; a league with both REC_FLEX and WRRB_FLEX could in a
+    rare case do slightly better than this greedy fill. Unfillable slots
+    contribute 0, not an error: a thin roster really does start a hole."""
+    remaining = sorted(players, key=lambda p: -p[1])
+    total = 0.0
+    for slot, count in slot_counts.items():
+        if slot in FLEX_SLOT_ELIGIBILITY:
+            continue
+        taken = [p for p in remaining if p[0] == slot][:count]
+        total += sum(v for _, v in taken)
+        for p in taken:
+            remaining.remove(p)
+    for slot, eligible in FLEX_SLOT_ELIGIBILITY.items():
+        taken = [p for p in remaining if p[0] in eligible][: slot_counts.get(slot, 0)]
+        total += sum(v for _, v in taken)
+        for p in taken:
+            remaining.remove(p)
+    return total
+
+
 # -- Phase 2: depth chart snapshot to week mapping ---------------------------
 
 def discounted_pick_value(base_value: float, years_from_base: int, discount_rate: float) -> float:

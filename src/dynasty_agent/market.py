@@ -104,6 +104,23 @@ def latest_value(conn: sqlite3.Connection, player_id: str) -> float | None:
 _PICK_ROUND_LABELS = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}
 
 
+def priced_pick_seasons(conn: sqlite3.Connection, round_num: int) -> list[int]:
+    """Every draft season FantasyCalc currently prices a pick of this round
+    for, ascending. Read from the live response, not assumed: FantasyCalc
+    drops a season once that rookie draft has happened, so the earliest
+    priced season moves forward every spring."""
+    label_suffix = f" {_PICK_ROUND_LABELS.get(round_num, f'{round_num}th')}"
+    seasons = []
+    for entry in fetch_values(conn):
+        player = entry.get("player") or {}
+        name = player.get("name") or ""
+        if player.get("position") == "PICK" and name.endswith(label_suffix):
+            year = name[: -len(label_suffix)]
+            if year.isdigit():
+                seasons.append(int(year))
+    return sorted(set(seasons))
+
+
 def pick_market_value(conn: sqlite3.Connection, season: int, round_num: int) -> float | None:
     """FantasyCalc's own unslotted market value for a future draft pick, for
     example "2027 1st", read from the same cached response sync_market_values

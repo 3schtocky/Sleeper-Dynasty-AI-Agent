@@ -20,6 +20,7 @@ from dynasty_agent.metrics import (
     injury_adjusted_variance,
     matchup_win_probability,
     percentile_rank,
+    starting_slot_counts,
     vegas_week_multiplier,
 )
 from dynasty_agent.valuation import player_valuations, resolve_player, to_nflverse_team
@@ -186,19 +187,6 @@ def project_player(
 FLEX_ELIGIBLE = ("RB", "WR", "TE")
 
 
-def _starting_slot_counts(roster_positions: list[str]) -> dict[str, int]:
-    """How many of each real starting slot this league uses, bench/taxi/IR
-    excluded, read from the league's own roster_positions rather than
-    hardcoded, so this stays correct if it ever runs against a differently
-    shaped league."""
-    counts: dict[str, int] = {}
-    for slot in roster_positions:
-        if slot in ("BN", "TAXI", "IR"):
-            continue
-        counts[slot] = counts.get(slot, 0) + 1
-    return counts
-
-
 def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: int, week: int, my_roster_id: int) -> dict:
     """The starting lineup, out of everyone eligible on my roster, that
     maximizes win probability against my actual Sleeper opponent this
@@ -216,7 +204,7 @@ def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: i
     if league_row is None:
         raise ValueError("No league data cached yet. Run `dynasty-agent sync` first.")
     roster_positions = json.loads(league_row["roster_positions_json"])
-    slot_counts = _starting_slot_counts(roster_positions)
+    slot_counts = starting_slot_counts(roster_positions)
     unsupported_slots = [s for s in slot_counts if s not in ("QB", "RB", "WR", "TE", "FLEX")]
 
     opponent = opponent_for_week(conn, my_roster_id, week)
@@ -252,7 +240,12 @@ def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: i
     non_flex_slots = list(pools.keys())
     flex_count = slot_counts.get("FLEX", 0)
 
-    best_prob, best_lineup = -1.0, None
+    # Ranked by (win probability, projected points), not win probability
+    # alone. Probability saturates: with no opponent set, or an edge big
+    # enough that the normal CDF rounds to exactly 1.0, every lineup ties,
+    # and an earlier version kept whichever tied lineup it happened to reach
+    # first, starting a 4-point RB over a 9-point WR in the flex.
+    best_key, best_prob, best_lineup = (-1.0, float("-inf")), -1.0, None
     best_points_total, best_points_lineup = -1.0, None
 
     slot_combos = [itertools.combinations(pools[slot], slot_counts[slot]) for slot in non_flex_slots]
@@ -271,8 +264,8 @@ def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: i
             mean_total = sum(my_projections[pid]["mean"] for pid in lineup)
             variance_total = sum(my_projections[pid]["variance"] for pid in lineup)
             prob = matchup_win_probability(mean_total - opponent_mean, (variance_total + opponent_variance) ** 0.5)
-            if prob > best_prob:
-                best_prob, best_lineup = prob, lineup
+            if (prob, mean_total) > best_key:
+                best_key, best_prob, best_lineup = (prob, mean_total), prob, lineup
             if mean_total > best_points_total:
                 best_points_total, best_points_lineup = mean_total, lineup
 
@@ -301,6 +294,20 @@ def optimize_lineup(conn: sqlite3.Connection, stats_season: int, vegas_season: i
 # who bid more.
 FAAB_MIN_VALUE_MULTIPLIER = 0.2
 FAAB_MAX_VALUE_MULTIPLIER = 3.0
+
+# Sleeper's own default FAAB budget, used only when the league's settings
+# don't carry waiver_budget at all, and reported as a default when used.
+DEFAULT_FAAB_BUDGET = 100
+
+
+def _available_player_ids(conn: sqlite3.Connection, valuations: dict, rostered_ids: set[str]) -> list[str]:
+    """Players with a valuation who could actually be claimed right now: on
+    no roster in this league and on an NFL team today. valuations come from
+    a completed season's stats, so without the team check every player who
+    retired or went unsigned since reads as a free agent, inflating the
+    percentile pool and able to top the FAAB target list."""
+    on_nfl_team = {r[0] for r in conn.execute("SELECT player_id FROM players WHERE team IS NOT NULL").fetchall()}
+    return [pid for pid in valuations if pid not in rostered_ids and pid in on_nfl_team]
 
 
 def faab_recommendation(
@@ -331,21 +338,31 @@ def faab_recommendation(
     roster_row = conn.execute("SELECT waiver_budget_used FROM rosters WHERE roster_id = ?", (my_roster_id,)).fetchone()
     if roster_row is None:
         raise ValueError(f"No roster found for roster_id {my_roster_id}.")
-    remaining_budget = 100 - (roster_row["waiver_budget_used"] or 0)
+    league_row = conn.execute("SELECT settings_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    if league_row is None:
+        raise ValueError("No league data cached yet. Run `dynasty-agent sync` first.")
+    league_settings = json.loads(league_row["settings_json"])
+    # The league's real FAAB budget, not a hardcoded $100 (an earlier
+    # version's assumption, right for this league only by coincidence).
+    total_budget = league_settings.get("waiver_budget")
+    budget_is_default = total_budget is None
+    if budget_is_default:
+        total_budget = DEFAULT_FAAB_BUDGET
+    remaining_budget = total_budget - (roster_row["waiver_budget_used"] or 0)
 
     if weeks_left is None:
-        league_row = conn.execute("SELECT settings_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
         state_row = conn.execute("SELECT week FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
-        if league_row is None or state_row is None:
-            raise ValueError("No league/state data cached yet. Run `dynasty-agent sync` first.")
-        playoff_week_start = json.loads(league_row["settings_json"]).get("playoff_week_start", 15)
+        if state_row is None:
+            raise ValueError("No NFL state cached yet. Run `dynasty-agent sync` first.")
+        playoff_week_start = league_settings.get("playoff_week_start", 15)
         current_week = state_row["week"] or 1
         weeks_left = max(playoff_week_start - current_week, 1)
 
     if valuations is None:
         valuations = player_valuations(conn, stats_season)
     rostered_ids = {r[0] for r in conn.execute("SELECT DISTINCT player_id FROM roster_players").fetchall()}
-    available_values = [v["win_now_value"] for pid, v in valuations.items() if pid not in rostered_ids]
+    available_ids = _available_player_ids(conn, valuations, rostered_ids)
+    available_values = [valuations[pid]["win_now_value"] for pid in available_ids]
 
     is_rostered = player["player_id"] in rostered_ids
     target_valuation = valuations.get(player["player_id"])
@@ -360,6 +377,8 @@ def faab_recommendation(
         "player": player["full_name"],
         "position": player["position"],
         "is_rostered": is_rostered,
+        "total_budget": total_budget,
+        "budget_is_default": budget_is_default,
         "remaining_budget": remaining_budget,
         "weeks_left": weeks_left,
         "target_win_now_value": target_value,
@@ -379,9 +398,9 @@ def top_faab_targets(conn: sqlite3.Connection, stats_season: int, my_roster_id: 
     rostered_ids = {r[0] for r in conn.execute("SELECT DISTINCT player_id FROM roster_players").fetchall()}
     available = sorted(
         (
-            (pid, v)
-            for pid, v in valuations.items()
-            if pid not in rostered_ids and v["win_now_value"] > 0
+            (pid, valuations[pid])
+            for pid in _available_player_ids(conn, valuations, rostered_ids)
+            if valuations[pid]["win_now_value"] > 0
         ),
         key=lambda item: -item[1]["win_now_value"],
     )

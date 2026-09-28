@@ -32,10 +32,10 @@ import sqlite3
 from pathlib import Path
 
 import duckdb
-import httpx
 
 from dynasty_agent.config import NFLVERSE_CACHE_DIR
 from dynasty_agent.db import utcnow
+from dynasty_agent.nflverse import download
 
 RELEASE_BASE = "https://github.com/nflverse/nflverse-data/releases/download"
 
@@ -78,18 +78,10 @@ def ensure_cached(kind: str, force: bool = False) -> Path:
     season-scoped: one download covers every season, re-run with force=True
     to pick up nflverse's periodic updates (draft_picks and combine are both
     updated in place, not re-released under a new tag)."""
-    NFLVERSE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     dest = NFLVERSE_CACHE_DIR / f"{kind}.parquet"
     if dest.exists() and not force:
         return dest
-
-    url = _url(kind)
-    with httpx.stream("GET", url, timeout=60.0, follow_redirects=True) as response:
-        response.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
-                f.write(chunk)
-    return dest
+    return download(_url(kind), dest)
 
 
 def ingest_draft_picks(conn: sqlite3.Connection, force: bool = False) -> int:
@@ -137,14 +129,28 @@ def ingest_draft_picks(conn: sqlite3.Connection, force: bool = False) -> int:
     return len(upsert_rows)
 
 
+def combine_row_id(
+    season: int, pfr_id: str | None, cfb_id: str | None, player_name: str | None, college: str | None
+) -> str:
+    """nfl_combine's surrogate key: season plus the first identifier present
+    of pfr_id, cfb_id, or lowercased name|college. See migration 0004 for
+    why rows without a pfr_id can't simply be dropped."""
+    if pfr_id:
+        return f"{season}:pfr:{pfr_id}"
+    if cfb_id:
+        return f"{season}:cfb:{cfb_id}"
+    return f"{season}:name:{(player_name or '').strip().lower()}|{(college or '').strip().lower()}"
+
+
 def ingest_combine(conn: sqlite3.Connection, force: bool = False) -> int:
-    """Cache and upsert every real combine testing result into nfl_combine.
-    draft_team is kept as-is (a full franchise name, not a code) since it is
+    """Cache every real combine testing result and replace nfl_combine with
+    it, rows with no pfr_id included (see combine_row_id). draft_team is
+    kept as-is (a full franchise name, not a code) since it is
     informational only, see the module docstring. Returns the number of raw
     rows processed, which can run a few rows ahead of the table's final
     count: confirmed live, 3 (season, pfr_id) pairs repeat in nflverse's own
     file (a real PFR id collision on their end, not an ingestion bug here),
-    and the primary key's ON CONFLICT keeps the later one."""
+    and the later row wins."""
     path = ensure_cached("combine", force=force)
     con = duckdb.connect()
     try:
@@ -154,7 +160,7 @@ def ingest_combine(conn: sqlite3.Connection, force: bool = False) -> int:
                    pfr_id, cfb_id, player_name, pos, school,
                    ht, wt, forty, bench, vertical, broad_jump, cone, shuttle
             FROM read_parquet(?)
-            WHERE season IS NOT NULL AND pfr_id IS NOT NULL
+            WHERE season IS NOT NULL
             """,
             [str(path)],
         ).fetchall()
@@ -162,24 +168,19 @@ def ingest_combine(conn: sqlite3.Connection, force: bool = False) -> int:
         con.close()
 
     fetched_at = utcnow()
-    upsert_rows = [tuple(r) + (fetched_at,) for r in rows]
+    upsert_rows = [
+        (combine_row_id(r[0], r[5], r[6], r[7], r[9]),) + tuple(r) + (fetched_at,)
+        for r in rows
+    ]
 
+    conn.execute("DELETE FROM nfl_combine")
     conn.executemany(
         """
-        INSERT INTO nfl_combine (
-            season, draft_year, draft_team, draft_round, draft_ovr,
+        INSERT OR REPLACE INTO nfl_combine (
+            combine_id, season, draft_year, draft_team, draft_round, draft_ovr,
             pfr_id, cfb_id, player_name, position, college,
             height_in, weight_lb, forty, bench, vertical, broad_jump, cone, shuttle, fetched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (season, pfr_id) DO UPDATE SET
-            draft_year = excluded.draft_year, draft_team = excluded.draft_team,
-            draft_round = excluded.draft_round, draft_ovr = excluded.draft_ovr,
-            cfb_id = excluded.cfb_id, player_name = excluded.player_name,
-            position = excluded.position, college = excluded.college,
-            height_in = excluded.height_in, weight_lb = excluded.weight_lb,
-            forty = excluded.forty, bench = excluded.bench, vertical = excluded.vertical,
-            broad_jump = excluded.broad_jump, cone = excluded.cone, shuttle = excluded.shuttle,
-            fetched_at = excluded.fetched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         upsert_rows,
     )

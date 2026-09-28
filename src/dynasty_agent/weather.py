@@ -37,7 +37,9 @@ import re
 import duckdb
 import httpx
 
-GAMES_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.parquet"
+from dynasty_agent import nflverse
+from dynasty_agent.valuation import to_nflverse_team
+
 WIND_FLAG_MPH = 15.0
 
 # This project's own static reference, not from any nflverse file (none
@@ -99,6 +101,7 @@ def _game_for_team(season: int, week: int, team: str) -> dict | None:
     """The one real game a team plays in a given week, home or away, with
     its actual stadium_id, roof, and kickoff date/time. None if the team
     has no game that week (a bye) or the schedule doesn't cover it."""
+    games_path = str(nflverse.ensure_games_cached())
     con = duckdb.connect()
     try:
         row = con.execute(
@@ -108,7 +111,7 @@ def _game_for_team(season: int, week: int, team: str) -> dict | None:
             WHERE season = ? AND week = ? AND (home_team = ? OR away_team = ?)
             LIMIT 1
             """,
-            [GAMES_URL, season, week, team, team],
+            [games_path, season, week, team, team],
         ).fetchone()
     finally:
         con.close()
@@ -153,8 +156,13 @@ def game_wind_forecast(season: int, week: int, team: str) -> dict:
     {"status": "indoors", "stadium": ..., "roof": ...} |
     {"status": "not_covered", "stadium": ..., "reason": ...} |
     {"status": "not_forecasted_yet", "stadium": ...} |
-    {"status": "ok", "stadium": ..., "wind_mph": float, "flag": bool}."""
-    game = _game_for_team(season, week, team)
+    {"status": "ok", "stadium": ..., "wind_mph": float, "flag": bool}.
+
+    team is normalized to nflverse's code before the schedule lookup: callers
+    pass Sleeper's code, and Sleeper's "LAR" never matches the schedule's
+    "LA", which read every Rams game as a bye. Same bug shape as
+    valuation.TEAM_ALIASES, fixed here the same way."""
+    game = _game_for_team(season, week, to_nflverse_team(team))
     if game is None:
         return {"status": "bye"}
 
