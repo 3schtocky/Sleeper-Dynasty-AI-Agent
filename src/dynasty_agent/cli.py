@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 
-from dynasty_agent import blend, college, config, market, matchup, nflverse, prospect_model, prospects, sleeper, valuation, weather, weekly
+from dynasty_agent import blend, college, config, market, matchup, nflverse, prospect_model, prospects, refresh, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -177,7 +178,7 @@ def cmd_fit_prospect_model(args: argparse.Namespace) -> None:
     if league is None:
         print("No league data cached yet. Run `dynasty-agent sync` first.", file=sys.stderr)
         raise SystemExit(1)
-    report = prospect_model.fit_and_store(conn, json.loads(league["scoring_settings_json"]))
+    report = prospect_model.fit_and_store(conn, json.loads(league["scoring_settings_json"]), _latest_complete_season(conn))
     cov = report["coverage"]
     first, last = report["classes"]
     print(f"Prospect model fit on the {first}-{last} draft classes, drafted QB/RB/WR/TE, your league's scoring.")
@@ -301,6 +302,25 @@ def cmd_prospect_board(args: argparse.Namespace) -> None:
         print(_BOARD_LEGEND)
 
 
+def cmd_refresh(args: argparse.Namespace) -> None:
+    _require_config()
+    conn = get_db()
+    started = datetime.now()
+    print(f"=== dynasty-agent refresh, {started:%Y-%m-%d %H:%M} ===")
+    results = refresh.run(conn)
+    for r in results:
+        print(f"  [{'ok' if r['ok'] else 'FAILED'}] {r['step']}: {r['detail']}")
+        if not r["ok"] and args.verbose:
+            print(r["traceback"])
+    print("\nHow current everything is:")
+    for label, value in refresh.freshness(conn):
+        print(f"  {label:<22} {value}")
+    failed = [r for r in results if not r["ok"]]
+    print(f"\n{len(results) - len(failed)} of {len(results)} steps ok, {(datetime.now() - started).seconds}s.")
+    if failed:
+        raise SystemExit(1)
+
+
 def cmd_calibrate_blend(args: argparse.Namespace) -> None:
     conn = get_db()
     season = args.season or _latest_complete_season(conn)
@@ -334,7 +354,7 @@ def _latest_complete_season(conn) -> int:
     if row is None or row["season"] is None:
         print("No synced NFL state. Run `dynasty-agent sync` first.", file=sys.stderr)
         raise SystemExit(1)
-    return int(row["season"]) - (0 if row["season_type"] == "off" else 1)
+    return refresh.latest_complete_season(int(row["season"]), row["season_type"])
 
 
 def _latest_ingested_season(conn) -> int | None:
@@ -836,6 +856,14 @@ def main() -> None:
     board_parser.add_argument("--class", dest="draft_class", type=int, required=True, help="NFL draft year, e.g. 2027.")
     board_parser.add_argument("--limit", type=int, default=40, help="How many players to show (default 40).")
     board_parser.set_defaults(func=cmd_prospect_board)
+
+    refresh_parser = sub.add_parser(
+        "refresh",
+        help="Bring everything current in one run: Sleeper, FantasyCalc, this season's NFL stats and matchups, and "
+        "(by time of year) college stats, draft data, and the prospect model. Reports how old each source is.",
+    )
+    refresh_parser.add_argument("--verbose", action="store_true", help="Print full tracebacks for failed steps.")
+    refresh_parser.set_defaults(func=cmd_refresh)
 
     calibrate_parser = sub.add_parser(
         "calibrate-blend",

@@ -2,8 +2,9 @@
 player's first three NFL seasons, in this league's own scoring, fitted
 against real outcomes rather than hand-set weights (by explicit decision).
 
-Training set, by explicit decision: drafted QB/RB/WR/TE from the 2018
-through 2023 classes whose college stats link to their NFL ids exactly.
+Training set, by explicit decision: drafted QB/RB/WR/TE from the 2018 class
+through the newest class with three completed NFL seasons (2023, as of the
+2025 season), whose college stats link to their NFL ids exactly.
 ESPN keeps one athlete id from college into the NFL only from about the
 2018 class on (checked live: 0 of ~80 linked per class 2012-2015, 25 of 83
 in 2017, 60 of 83 in 2018, 76-85 from 2019); older classes would need name
@@ -49,7 +50,19 @@ from dynasty_agent.metrics import (
     speed_score,
 )
 
-TRAINING_CLASSES = range(2018, 2024)
+# The first draft class with exact college links (see the module
+# docstring). The last one moves forward every year: the newest class with
+# three completed NFL seasons.
+FIRST_TRAINING_CLASS = 2018
+
+
+def training_classes(last_complete_season: int) -> range:
+    return range(FIRST_TRAINING_CLASS, last_complete_season - 2 + 1)
+
+
+def training_classes_label(last_complete_season: int) -> str:
+    classes = training_classes(last_complete_season)
+    return f"{classes.start}-{classes.stop - 1}"
 POSITIONS = ("QB", "RB", "WR", "TE")
 RIDGE_LAMBDA = 1.0
 # The NFL draft runs in late April; draft age is taken on April 25.
@@ -235,10 +248,10 @@ def first_three_season_ppg(scoring_settings: dict, seasons: range) -> dict[tuple
     return totals
 
 
-def training_rows(conn: sqlite3.Connection, scoring_settings: dict) -> tuple[list[dict], dict]:
+def training_rows(conn: sqlite3.Connection, scoring_settings: dict, classes: range) -> tuple[list[dict], dict]:
     """(rows, coverage). Each row: identity, features, and target. coverage
     counts every drafted skill player and why any was left out."""
-    first_season, last_season = TRAINING_CLASSES.start, TRAINING_CLASSES.stop - 1 + 2
+    first_season, last_season = classes.start, classes.stop - 1 + 2
     points = first_three_season_ppg(scoring_settings, range(first_season, last_season + 1))
     combine = combine_measurements(conn)
 
@@ -250,7 +263,7 @@ def training_rows(conn: sqlite3.Connection, scoring_settings: dict) -> tuple[lis
         LEFT JOIN player_ids pi ON pi.gsis_id = d.gsis_id
         WHERE d.season BETWEEN ? AND ? AND d.position IN ({",".join("?" * len(POSITIONS))})
         """,
-        (TRAINING_CLASSES.start, TRAINING_CLASSES.stop - 1, *POSITIONS),
+        (classes.start, classes.stop - 1, *POSITIONS),
     ).fetchall()
 
     coverage = {"drafted": len(picks), "no_college_link": 0, "no_birthdate": 0, "used": 0}
@@ -346,12 +359,14 @@ def leave_one_class_out(rows: list[dict], names: tuple[str, ...]) -> dict:
     return {"mae": sum(errors) / len(errors), "r2": 1 - ss_res / ss_tot if ss_tot else 0.0, "n": len(targets)}
 
 
-def fit_and_store(conn: sqlite3.Connection, scoring_settings: dict) -> dict:
-    """Fit both variants plus the baseline, cross-validate all three, and
-    store the fitted weights with their metadata in prospect_model.
-    Returns the full report."""
-    rows, coverage = training_rows(conn, scoring_settings)
-    report = {"coverage": coverage, "classes": [TRAINING_CLASSES.start, TRAINING_CLASSES.stop - 1], "variants": {}}
+def fit_and_store(conn: sqlite3.Connection, scoring_settings: dict, last_complete_season: int) -> dict:
+    """Fit every variant on each class from FIRST_TRAINING_CLASS through the
+    newest with three completed NFL seasons, cross-validate each, and store
+    the fitted weights with their metadata in prospect_model. Returns the
+    full report."""
+    classes = training_classes(last_complete_season)
+    rows, coverage = training_rows(conn, scoring_settings, classes)
+    report = {"coverage": coverage, "classes": [classes.start, classes.stop - 1], "variants": {}}
     for variant, names in VARIANTS:
         rows_v = [r for r in rows if all(r["features"][n] is not None for n in names)]
         weights = fit_ridge(_matrix(rows_v, names), [r["target"] for r in rows_v])
@@ -369,7 +384,7 @@ def fit_and_store(conn: sqlite3.Connection, scoring_settings: dict) -> dict:
                 fitted_at = excluded.fitted_at
             """,
             (variant, json.dumps(list(names)), json.dumps(weights), len(rows_v), cv["mae"], cv["r2"],
-             f"{TRAINING_CLASSES.start}-{TRAINING_CLASSES.stop - 1}", RIDGE_LAMBDA, utcnow()),
+             f"{classes.start}-{classes.stop - 1}", RIDGE_LAMBDA, utcnow()),
         )
     conn.commit()
     return report
