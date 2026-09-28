@@ -39,7 +39,23 @@ RELEASE_BASE = "https://github.com/sportsdataverse/sportsdataverse-data/releases
 FILES = {
     "player_box": ("espn_cfb_player_box", "player_box_{season}.parquet"),
     "game_rosters": ("espn_cfb_game_rosters", "game_rosters_{season}.parquet"),
+    "team_info": ("cfb_team_info", "cfb_team_info_{season}.parquet"),
+    "ratings": ("cfb_ratings", "cfb_ratings_{season}.parquet"),
 }
+
+# Power conferences by season. The Pac-12 was one through 2023 and is two
+# teams from 2024 on; Notre Dame (ESPN team 87) is an independent that
+# schedules like one.
+POWER_CONFERENCES = ("SEC", "Big Ten", "Big 12", "ACC")
+NOTRE_DAME_TEAM_ID = "87"
+
+
+def is_power_conference(conference: str | None, season: int, team_id: str) -> bool:
+    if team_id == NOTRE_DAME_TEAM_ID:
+        return True
+    if conference == "Pac-12":
+        return season <= 2023
+    return conference in POWER_CONFERENCES
 
 # ESPN position id -> position, for the four positions this league starts.
 ESPN_POSITION_IDS: dict[str, str] = {"1": "WR", "7": "TE", "8": "QB", "9": "RB"}
@@ -186,6 +202,7 @@ def ingest_season(conn: sqlite3.Connection, season: int, force: bool = False) ->
             for aid, name, dob, height, weight in athlete_rows
         ],
     )
+    team_rows = _ingest_team_context(conn, season, force, fetched_at)
     conn.commit()
 
     team_games = sorted({(r[2], r[17]) for r in season_rows}, key=lambda t: t[1])
@@ -193,5 +210,33 @@ def ingest_season(conn: sqlite3.Connection, season: int, force: bool = False) ->
     skill = sum(1 for r in season_rows if r[4] is not None)
     return (
         f"{season}: {len(season_rows)} player-team seasons ({skill} QB/RB/WR/TE), "
-        f"{len(team_games)} teams, median {median_games} games per team in ESPN's box scores."
+        f"{len(team_games)} teams, median {median_games} games per team in ESPN's box scores, "
+        f"{team_rows} team context rows."
     )
+
+
+def _ingest_team_context(conn: sqlite3.Connection, season: int, force: bool, fetched_at: str) -> int:
+    """Replace this season's cfb_team_season rows: conference and
+    classification for every team, net_z for FBS teams that have a rating."""
+    info_path = ensure_cached("team_info", season, force=force)
+    ratings_path = ensure_cached("ratings", season, force=force)
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            """
+            SELECT CAST(i.team_id AS VARCHAR), i.school, i.conference, i.classification,
+                   CAST(r.net_z AS DOUBLE), CAST(r.net_rank AS INTEGER)
+            FROM read_parquet(?) i
+            LEFT JOIN read_parquet(?) r ON CAST(r.team_id AS VARCHAR) = CAST(i.team_id AS VARCHAR)
+            """,
+            [str(info_path), str(ratings_path)],
+        ).fetchall()
+    finally:
+        con.close()
+    conn.execute("DELETE FROM cfb_team_season WHERE season = ?", (season,))
+    conn.executemany(
+        "INSERT OR REPLACE INTO cfb_team_season (team_id, season, school, conference, classification, net_z, net_rank, fetched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(tid, season, school, conf, cls, net_z, rank, fetched_at) for tid, school, conf, cls, net_z, rank in rows],
+    )
+    return len(rows)

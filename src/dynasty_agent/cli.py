@@ -273,17 +273,20 @@ def cmd_prospect_board(args: argparse.Namespace) -> None:
         print(
             f"Ranked on college production through the {board['last_college_season']} season. Held-out accuracy is low: "
             f"R^2 {with_age['cv_r2']:.2f} with a real birth date, {no_age['cv_r2']:.2f} without one (most prospects). "
-            f"Draft capital explains far more; switch to --mode post-draft once the NFL draft happens."
+            f"Draft capital explains far more; switch to --mode post-draft once the NFL draft happens. "
+            f"Running backs are under-ranked here: dominator rating measures receiving only."
         )
         print(
             f"Eligibility is estimated as 3+ college seasons on record, real declarations are unknown until January. "
             f"A season counts only with {prospect_model.MIN_TEAM_GAMES}+ team games and "
             f"{prospect_model.MIN_PLAYER_GAMES}+ player games in ESPN's data, so an in-progress season joins once it "
-            f"gets there; {board['skipped_thin_sample']} players had no qualifying season and are left off.\n"
+            f"gets there; {board['skipped_thin_sample']} players had no qualifying season and "
+            f"{board['skipped_unrated_team']} played for an unrated (mostly FCS) team the model never saw in training, "
+            f"both left off rather than guessed. Team strength: the peak season's opponent-adjusted rating.\n"
         )
         header = (
             f"{'#':>3} {'Player':<24} {'Pos':<3} {'Seasons':>7} {'Games':>5} {'Age':>5} {'Dom':>5} "
-            f"{'RecBreakout':<14} {'Proj':>5} {'League':>6}"
+            f"{'RecBreakout':<14} {'Conf':<12} {'TeamZ':>5} {'Proj':>5} {'League':>6}"
         )
         print(header)
         print("-" * len(header))
@@ -292,7 +295,8 @@ def cmd_prospect_board(args: argparse.Namespace) -> None:
                 f"{i:>3} {r['name'][:24]:<24} {r['position']:<3} {r['college_seasons']:>7} {r['games_last_season']:>5} "
                 f"{fmt(r['draft_age'], '5.1f', 'n/a'):>5} "
                 f"{('-' if r['position'] == 'QB' else format(r['peak_dominator'], '5.2f')):>5} "
-                f"{_breakout_label(r):<14} {r['projected_ppg']:>5.1f} {r['league_ppg']:>6.1f}"
+                f"{_breakout_label(r):<14} {(r['conference'] or '')[:12]:<12} {r['team_strength']:>5.2f} "
+                f"{r['projected_ppg']:>5.1f} {r['league_ppg']:>6.1f}"
             )
         print(_BOARD_LEGEND)
 

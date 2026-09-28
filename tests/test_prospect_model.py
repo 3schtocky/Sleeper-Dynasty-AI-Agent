@@ -41,10 +41,13 @@ def test_leave_one_class_out_nearly_recovers_a_noiseless_relationship():
 
 
 def test_feature_row_zeroes_receiving_for_qbs_and_flags_unknowns():
-    college = {"seasons": [(2023, 0.30)], "peak_dominator": 0.30}
+    strong = {"power_conf": True, "fbs": True, "net_z": 1.5, "conference": "SEC"}
+    weak = {"power_conf": False, "fbs": True, "net_z": -0.8, "conference": "Sun Belt"}
+    college = {"seasons": [(2023, 0.30)], "peak_dominator": 0.30, "peak_team": strong, "last_team": weak}
     qb = pm.feature_row("QB", 1, 22.0, college, None, None)
     assert (qb["peak_dominator"], qb["broke_out"], qb["breakout_age"]) == (0.0, 0.0, 0.0)
     assert (qb["athletic_known"], qb["athletic"]) == (0.0, 0.0)
+    assert (qb["power_conf"], qb["team_strength"]) == (0.0, -0.8)  # a QB's context is his last season
 
     from datetime import date
     wr = pm.feature_row("WR", 20, 21.5, college, date(2003, 9, 1), 70.0)
@@ -52,6 +55,18 @@ def test_feature_row_zeroes_receiving_for_qbs_and_flags_unknowns():
     assert wr["breakout_age"] == pytest.approx(20.0 - pm.BREAKOUT_AGE_CENTER, abs=0.01)
     assert (wr["athletic_known"], wr["athletic"]) == (1.0, 20.0)
     assert wr["log_pick"] == pytest.approx(2.9957, abs=1e-3)
+    assert (wr["power_conf"], wr["team_strength"]) == (1.0, 1.5)  # a receiver's context is his peak season
+
+    unrated = pm.feature_row("WR", None, 21.0, {**college, "peak_team": {**weak, "net_z": None}}, None, None)
+    assert unrated["team_strength"] is None  # an FCS/unrated team stays None, never guessed
+
+
+def test_is_power_conference_tracks_realignment():
+    from dynasty_agent.college import is_power_conference
+    assert is_power_conference("Pac-12", 2023, "26")
+    assert not is_power_conference("Pac-12", 2024, "204")  # two-team Pac-12 from 2024
+    assert is_power_conference("FBS Independents", 2025, "87")  # Notre Dame
+    assert not is_power_conference("Sun Belt", 2025, "2026")
 
 
 def test_games_scheduled_changed_in_2021():

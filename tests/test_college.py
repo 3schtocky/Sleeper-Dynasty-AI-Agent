@@ -62,8 +62,18 @@ def files(tmp_path, monkeypatch):
         ],
     )
     con.execute(f"COPY rosters TO '{roster_path}' (FORMAT parquet)")
+    info_path = tmp_path / "team_info.parquet"
+    ratings_path = tmp_path / "ratings.parquet"
+    con.execute(
+        f"COPY (SELECT * FROM (VALUES (10, 'State U', 'SEC', 'fbs'), (20, 'Small College', 'UAC', 'fcs')) "
+        f"t(team_id, school, conference, classification)) TO '{info_path}' (FORMAT parquet)"
+    )
+    # Ratings cover FBS teams only, the way the real file does.
+    con.execute(
+        f"COPY (SELECT * FROM (VALUES ('10', 1.25, 8)) t(team_id, net_z, net_rank)) TO '{ratings_path}' (FORMAT parquet)"
+    )
     con.close()
-    paths = {"player_box": box_path, "game_rosters": roster_path}
+    paths = {"player_box": box_path, "game_rosters": roster_path, "team_info": info_path, "ratings": ratings_path}
     monkeypatch.setattr(college, "ensure_cached", lambda kind, season, force=False: paths[kind])
     return paths
 
@@ -90,6 +100,10 @@ def test_ingest_sums_each_stat_from_its_own_category(conn, files):
     qb = rows["Quarter Back"]
     assert (qb["position"], qb["pass_cmp"], qb["pass_att"], qb["pass_yds"], qb["pass_td"]) == ("QB", 20, 30, 250.0, 2)
     assert rows["Tight End"]["position"] == "TE"
+
+    teams = {r["team_id"]: dict(r) for r in conn.execute("SELECT * FROM cfb_team_season WHERE season = 2025")}
+    assert (teams["10"]["conference"], teams["10"]["classification"], teams["10"]["net_z"]) == ("SEC", "fbs", 1.25)
+    assert (teams["20"]["classification"], teams["20"]["net_z"]) == ("fcs", None)  # unrated, never filled in
 
 
 def test_reingest_replaces_the_season_and_keeps_a_known_birth_date(conn, files):

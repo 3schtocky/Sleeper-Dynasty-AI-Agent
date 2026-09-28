@@ -37,6 +37,7 @@ from datetime import date
 import duckdb
 
 from dynasty_agent import nflverse
+from dynasty_agent.college import is_power_conference
 from dynasty_agent.db import utcnow
 from dynasty_agent.metrics import (
     age_on,
@@ -81,22 +82,43 @@ def college_profile(conn: sqlite3.Connection, espn_id: str, before_season: int) 
     None when the player has no qualifying college season at all."""
     rows = conn.execute(
         """
-        SELECT season, rec_yds, rec_td, team_rec_yds, team_rec_td
-        FROM cfb_player_season
-        WHERE athlete_id = ? AND season < ? AND team_games >= ? AND games >= ?
+        SELECT p.season, p.team_id, p.rec_yds, p.rec_td, p.team_rec_yds, p.team_rec_td,
+               t.conference, t.classification, t.net_z
+        FROM cfb_player_season p
+        LEFT JOIN cfb_team_season t ON t.team_id = p.team_id AND t.season = p.season
+        WHERE p.athlete_id = ? AND p.season < ? AND p.team_games >= ? AND p.games >= ?
         """,
         (espn_id, before_season, MIN_TEAM_GAMES, MIN_PLAYER_GAMES),
     ).fetchall()
     if not rows:
         return None
     by_season: dict[int, float | None] = {}
+    best_row_by_season: dict[int, sqlite3.Row] = {}
     for r in rows:
         dom = dominator_rating(r["rec_yds"], r["rec_td"], r["team_rec_yds"], r["team_rec_td"])
         prior = by_season.get(r["season"])
         # A mid-season transfer is two team rows; keep the better share.
-        by_season[r["season"]] = dom if prior is None else max(prior, dom or 0.0)
-    doms = [d for d in by_season.values() if d is not None]
-    return {"seasons": sorted(by_season.items()), "peak_dominator": max(doms) if doms else 0.0}
+        if prior is None or (dom or 0.0) > prior:
+            by_season[r["season"]] = dom
+            best_row_by_season[r["season"]] = r
+    doms = {s: d for s, d in by_season.items() if d is not None}
+    peak_season = max(doms, key=doms.get) if doms else max(by_season)
+    last_season = max(by_season)
+    return {
+        "seasons": sorted(by_season.items()),
+        "peak_dominator": doms.get(peak_season, 0.0) if doms else 0.0,
+        "peak_team": _team_context(best_row_by_season[peak_season]),
+        "last_team": _team_context(best_row_by_season[last_season]),
+    }
+
+
+def _team_context(row: sqlite3.Row) -> dict:
+    return {
+        "power_conf": is_power_conference(row["conference"], row["season"], row["team_id"]),
+        "fbs": row["classification"] == "fbs",
+        "net_z": row["net_z"],
+        "conference": row["conference"],
+    }
 
 
 def _parse_date(value: str | None) -> date | None:
@@ -133,7 +155,16 @@ def feature_row(
     "unknown" and "bad" never look alike to the fit."""
     is_qb = position == "QB"
     status, b_age = breakout_age(college["seasons"], birthdate)
+    # Team context from the season that defines the player: his peak
+    # receiving season, or his last season for a QB.
+    team = college["last_team"] if is_qb else college["peak_team"]
     return {
+        # Every drafted player in the 2018-2023 training rows came from a
+        # rated FBS team, so an unrated (FCS) team is outside what the model
+        # has seen; pre_draft_board leaves those players off rather than
+        # guess. None here marks it.
+        "power_conf": float(team["power_conf"]),
+        "team_strength": team["net_z"],
         "pos_RB": float(position == "RB"),
         "pos_WR": float(position == "WR"),
         "pos_TE": float(position == "TE"),
@@ -151,6 +182,7 @@ def feature_row(
 POST_DRAFT_FEATURES = (
     "pos_RB", "pos_WR", "pos_TE", "log_pick", "draft_age", "peak_dominator",
     "broke_out", "never_broke_out", "breakout_age", "athletic_known", "athletic",
+    "power_conf", "team_strength",
 )
 PRE_DRAFT_FEATURES = tuple(f for f in POST_DRAFT_FEATURES if f != "log_pick")
 # Checked live: only 71 of 1,911 draft-eligible 2025 college skill players
@@ -461,7 +493,7 @@ def pre_draft_board(conn: sqlite3.Connection, draft_class: int, min_college_seas
         (last_season, min_college_seasons),
     ).fetchall()
     rows = []
-    skipped_thin = 0
+    skipped_thin = skipped_unrated = 0
     for c in candidates:
         college = college_profile(conn, c["athlete_id"], draft_class)
         if college is None:
@@ -470,6 +502,9 @@ def pre_draft_board(conn: sqlite3.Connection, draft_class: int, min_college_seas
         birthdate = _parse_date(c["date_of_birth"])
         draft_age = age_on(birthdate, date(draft_class, *DRAFT_MONTH_DAY))
         features = feature_row(c["position"], None, draft_age or 0.0, college, birthdate, None)
+        if features["team_strength"] is None:
+            skipped_unrated += 1  # FCS or unrated team: outside the model's training range
+            continue
         model = with_age if draft_age is not None else no_age
         rows.append({
             "name": c["name"], "position": c["position"], "college_seasons": c["seasons"],
@@ -477,8 +512,11 @@ def pre_draft_board(conn: sqlite3.Connection, draft_class: int, min_college_seas
             "peak_dominator": college["peak_dominator"],
             "breakout": breakout_age(college["seasons"], birthdate)[0],
             "model_used": "pre_draft" if draft_age is not None else "pre_draft_no_age",
+            "conference": (college["last_team"] if c["position"] == "QB" else college["peak_team"])["conference"],
+            "team_strength": features["team_strength"],
             "projected_ppg": _project(model, features),
         })
     _rank_by_league_value(rows)
     return {"mode": "pre_draft", "draft_class": draft_class, "models": {"pre_draft": with_age, "pre_draft_no_age": no_age},
-            "last_college_season": last_season, "skipped_thin_sample": skipped_thin, "rows": rows}
+            "last_college_season": last_season, "skipped_thin_sample": skipped_thin,
+            "skipped_unrated_team": skipped_unrated, "rows": rows}
