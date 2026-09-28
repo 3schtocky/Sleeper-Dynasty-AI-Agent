@@ -153,6 +153,15 @@ A ~4B model is fine at understanding a question and phrasing an answer, unreliab
 
 Tools, thin wrappers over functions that already return dicts, flat arguments, a small set so a 4B model routes reliably: valuate / my roster, evaluate_trade, set_lineup (optimize_lineup), faab_bid and waiver_targets, predict_matchup, game_conditions (weather and schedule), prospect_board, picks, taxi. Player names stay resolved by `valuation.resolve_player`; an ambiguous name ("Justin Jefferson" matches a WR and an LB) comes back as a clarifying question, never a guess.
 
+### Step 0, runtime verified before any project code (2026-09-28)
+Ollama 0.34.4 installed and serving on localhost:11434, 336 GB free, the MacBook Air M4 runs a 4B model 100% on GPU at 3.9 GB.
+
+Model candidates, tested raw against Ollama's API with the same tool definitions and questions:
+- `qwen3:4b` (the reasoning model, 4.0B, Q4_K_M, reports tools support): routed both test questions correctly, however took a median ~50s per turn warm. Diagnosed, not guessed: 33 tokens/s generation, a normal speed, spent on ~400 tokens of reasoning before every tool call, even with Ollama's `think: false` (the reasoning moved into the visible answer instead of the thinking channel). Qwen's `/no_think` switch cut it only to 264 tokens. Also invented a fact it couldn't know (asked for week 1 in week 4).
+- `qwen3:4b-instruct` (same size, non-reasoning): median 1.6s per turn warm (0.6-1.9s; 18.5s once to load into memory), ~35 tokens generated, routed both questions correctly, invented nothing. The working choice; the bake-off in step 6 still decides it on a full question set.
+
+Design rules this surfaced, before any code: never ask the model for anything Python already knows (current week, the user's roster, the season), Python fills those in; and accept any reasonable argument format from the model (it wrote picks as "2027-1" in one run and "2027 1st" in the next), the tool layer normalizes.
+
 ### Build order
 1. [ ] Refactor: move printing out of `cli.py` into formatters, extract `digest` assembly into `weekly.py`, so the CLI and chat share one path returning plain dicts.
 2. [ ] `llm.py`: a minimal Ollama client (`POST /api/chat` with tools), model and URL from `.env`.
