@@ -44,6 +44,7 @@ from dynasty_agent.metrics import (
     breakout_age,
     compute_fantasy_points,
     dominator_rating,
+    production_score,
     speed_score,
 )
 
@@ -64,16 +65,27 @@ def games_scheduled(season: int) -> int:
 # -- features -----------------------------------------------------------------
 
 
+# A college season counts toward dominator and breakout only with a real
+# sample behind it. ESPN's box scores carry an FCS team only in its games
+# against FBS opponents, often 1 or 2 a year, and one game where a small
+# school's WR caught 85% of the yards swamped the first pre-draft board
+# (every top-15 row was a 1-4 game sample, found on the live run). Both
+# thresholds are round, stated numbers, not fitted.
+MIN_TEAM_GAMES = 6
+MIN_PLAYER_GAMES = 4
+
+
 def college_profile(conn: sqlite3.Connection, espn_id: str, before_season: int) -> dict | None:
-    """Peak dominator, breakout status, and final-season receiving share
-    from every college season before the draft. None when the player has
-    no linked college seasons at all."""
+    """Peak dominator and every season's dominator, from each college season
+    before the draft with a real sample (MIN_TEAM_GAMES, MIN_PLAYER_GAMES).
+    None when the player has no qualifying college season at all."""
     rows = conn.execute(
         """
         SELECT season, rec_yds, rec_td, team_rec_yds, team_rec_td
-        FROM cfb_player_season WHERE athlete_id = ? AND season < ?
+        FROM cfb_player_season
+        WHERE athlete_id = ? AND season < ? AND team_games >= ? AND games >= ?
         """,
-        (espn_id, before_season),
+        (espn_id, before_season, MIN_TEAM_GAMES, MIN_PLAYER_GAMES),
     ).fetchall()
     if not rows:
         return None
@@ -141,7 +153,18 @@ POST_DRAFT_FEATURES = (
     "broke_out", "never_broke_out", "breakout_age", "athletic_known", "athletic",
 )
 PRE_DRAFT_FEATURES = tuple(f for f in POST_DRAFT_FEATURES if f != "log_pick")
+# Checked live: only 71 of 1,911 draft-eligible 2025 college skill players
+# have a real birth date on record, and age is never estimated (explicit
+# decision), so pre-draft ranking needs a variant that doesn't use it.
+PRE_DRAFT_NO_AGE_FEATURES = tuple(f for f in PRE_DRAFT_FEATURES if f != "draft_age")
 BASELINE_FEATURES = ("pos_RB", "pos_WR", "pos_TE", "log_pick")
+
+VARIANTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("post_draft", POST_DRAFT_FEATURES),
+    ("baseline_draft_capital", BASELINE_FEATURES),
+    ("pre_draft", PRE_DRAFT_FEATURES),
+    ("pre_draft_no_age", PRE_DRAFT_NO_AGE_FEATURES),
+)
 
 
 # -- outcomes -----------------------------------------------------------------
@@ -297,8 +320,7 @@ def fit_and_store(conn: sqlite3.Connection, scoring_settings: dict) -> dict:
     Returns the full report."""
     rows, coverage = training_rows(conn, scoring_settings)
     report = {"coverage": coverage, "classes": [TRAINING_CLASSES.start, TRAINING_CLASSES.stop - 1], "variants": {}}
-    for variant, names in (("post_draft", POST_DRAFT_FEATURES), ("pre_draft", PRE_DRAFT_FEATURES),
-                           ("baseline_draft_capital", BASELINE_FEATURES)):
+    for variant, names in VARIANTS:
         rows_v = [r for r in rows if all(r["features"][n] is not None for n in names)]
         weights = fit_ridge(_matrix(rows_v, names), [r["target"] for r in rows_v])
         cv = leave_one_class_out(rows_v, names)
@@ -326,3 +348,137 @@ def load_model(conn: sqlite3.Connection, variant: str) -> dict | None:
     if row is None:
         return None
     return {**dict(row), "features": json.loads(row["features_json"]), "weights": json.loads(row["weights_json"])}
+
+
+# -- the prospect board -------------------------------------------------------------
+#
+# Post-draft ranks on the draft-capital baseline, not the full post-draft
+# fit: checked on 2018-2023, adding college production, age, and
+# athleticism to draft capital did not improve out-of-sample error overall
+# (MAE 2.65 both) or within any position reliably (it got slightly worse for
+# RB, WR, and QB). College inputs are still shown on each row, as context.
+#
+# Pre-draft ranks on college production alone, a weak signal, labeled weak
+# on every run: its job is a first read on a class before the NFL draft
+# order exists, not a confident ranking.
+
+# An undrafted rookie is priced as if taken one pick after the last real
+# pick. The model never saw an undrafted player in training, so this is an
+# extrapolation, and every such row says so.
+UNDRAFTED_PICK = 260
+
+
+def _rank_by_league_value(rows: list[dict]) -> None:
+    """Sort by projected PPG after this league's position weighting
+    (metrics.production_score: QB x0.70 for 1QB, WR x1.05), the same
+    adjustment valuate and trade apply, so a QB isn't ranked like a
+    superflex asset. Both numbers stay on the row."""
+    for r in rows:
+        r["league_ppg"] = production_score(r["projected_ppg"], r["position"])
+    rows.sort(key=lambda r: -r["league_ppg"])
+
+
+def _require_model(conn: sqlite3.Connection, variant: str) -> dict:
+    model = load_model(conn, variant)
+    if model is None:
+        raise ValueError("No fitted prospect model yet. Run `dynasty-agent fit-prospect-model` first.")
+    return model
+
+
+def _project(model: dict, features: dict) -> float:
+    return predict(model["weights"], [features[n] for n in model["features"]])
+
+
+def _athletic_for(combine: dict[str, list[dict]], position: str, pfr_id: str | None) -> float | None:
+    population = combine.get(position, [])
+    mine = next((m for m in population if pfr_id and m["pfr_id"] == pfr_id), None)
+    return athletic_score(mine, population)[0] if mine else None
+
+
+def post_draft_board(conn: sqlite3.Connection, draft_class: int) -> dict:
+    """Every QB/RB/WR/TE actually drafted in draft_class, ranked by the
+    draft-capital model's projected PPG, with college, age, athleticism,
+    landing spot, and FantasyCalc's current value shown as inputs."""
+    from dynasty_agent import market  # local: market imports nothing from here, kept lazy for startup cost
+
+    model = _require_model(conn, "baseline_draft_capital")
+    combine = combine_measurements(conn)
+    picks = conn.execute(
+        f"""
+        SELECT d.season, d.pick, d.round, d.team, d.position, d.player_name, d.pfr_player_id,
+               pi.espn_id, pi.sleeper_id, pi.birthdate
+        FROM nfl_draft_picks d
+        LEFT JOIN player_ids pi ON pi.gsis_id = d.gsis_id
+        WHERE d.season = ? AND d.position IN ({",".join("?" * len(POSITIONS))})
+        """,
+        (draft_class, *POSITIONS),
+    ).fetchall()
+    rows = []
+    for p in picks:
+        birthdate = _parse_date(p["birthdate"])
+        college = college_profile(conn, p["espn_id"], p["season"]) if p["espn_id"] else None
+        status, b_age = breakout_age(college["seasons"], birthdate) if college else ("no college data", None)
+        features = {
+            "pos_RB": float(p["position"] == "RB"), "pos_WR": float(p["position"] == "WR"),
+            "pos_TE": float(p["position"] == "TE"), "log_pick": math.log(p["pick"]),
+        }
+        rows.append({
+            "name": p["player_name"], "position": p["position"], "nfl_team": p["team"],
+            "round": p["round"], "pick": p["pick"],
+            "draft_age": age_on(birthdate, date(draft_class, *DRAFT_MONTH_DAY)),
+            "peak_dominator": college["peak_dominator"] if college else None,
+            "breakout": status, "breakout_age": b_age,
+            "athletic": _athletic_for(combine, p["position"], p["pfr_player_id"]),
+            "sleeper_id": p["sleeper_id"],
+            "market_value": market.latest_value(conn, p["sleeper_id"]) if p["sleeper_id"] else None,
+            "projected_ppg": _project(model, features),
+        })
+    _rank_by_league_value(rows)
+    return {"mode": "post_draft", "draft_class": draft_class, "model": model, "rows": rows}
+
+
+def pre_draft_board(conn: sqlite3.Connection, draft_class: int, min_college_seasons: int = 3) -> dict:
+    """College QB/RB/WR/TE who played in the season before draft_class, have
+    at least min_college_seasons seasons on record (a stand-in for draft
+    eligibility; actual declarations are unknown until January), and are
+    not already drafted. Ranked by the pre-draft model: with age where a
+    real birth date exists, without it otherwise, each row saying which."""
+    with_age = _require_model(conn, "pre_draft")
+    no_age = _require_model(conn, "pre_draft_no_age")
+    last_season = draft_class - 1
+    candidates = conn.execute(
+        """
+        SELECT s.athlete_id, max(s.athlete_name) AS name, max(s.position) AS position,
+               (SELECT count(DISTINCT season) FROM cfb_player_season s2 WHERE s2.athlete_id = s.athlete_id) AS seasons,
+               max(s.games) AS games_this_season, a.date_of_birth
+        FROM cfb_player_season s
+        LEFT JOIN cfb_athletes a ON a.athlete_id = s.athlete_id
+        WHERE s.season = ? AND s.position IN ('QB', 'RB', 'WR', 'TE')
+          AND s.athlete_id NOT IN (SELECT espn_id FROM player_ids WHERE draft_year IS NOT NULL AND espn_id IS NOT NULL)
+        GROUP BY s.athlete_id
+        HAVING seasons >= ?
+        """,
+        (last_season, min_college_seasons),
+    ).fetchall()
+    rows = []
+    skipped_thin = 0
+    for c in candidates:
+        college = college_profile(conn, c["athlete_id"], draft_class)
+        if college is None:
+            skipped_thin += 1  # no season with a real sample (MIN_TEAM_GAMES / MIN_PLAYER_GAMES)
+            continue
+        birthdate = _parse_date(c["date_of_birth"])
+        draft_age = age_on(birthdate, date(draft_class, *DRAFT_MONTH_DAY))
+        features = feature_row(c["position"], None, draft_age or 0.0, college, birthdate, None)
+        model = with_age if draft_age is not None else no_age
+        rows.append({
+            "name": c["name"], "position": c["position"], "college_seasons": c["seasons"],
+            "games_last_season": c["games_this_season"], "draft_age": draft_age,
+            "peak_dominator": college["peak_dominator"],
+            "breakout": breakout_age(college["seasons"], birthdate)[0],
+            "model_used": "pre_draft" if draft_age is not None else "pre_draft_no_age",
+            "projected_ppg": _project(model, features),
+        })
+    _rank_by_league_value(rows)
+    return {"mode": "pre_draft", "draft_class": draft_class, "models": {"pre_draft": with_age, "pre_draft_no_age": no_age},
+            "last_college_season": last_season, "skipped_thin_sample": skipped_thin, "rows": rows}

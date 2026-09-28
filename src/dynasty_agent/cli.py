@@ -190,6 +190,7 @@ def cmd_fit_prospect_model(args: argparse.Namespace) -> None:
     labels = {
         "post_draft": "Post-draft (draft capital + college + age + athleticism)",
         "pre_draft": "Pre-draft (no draft capital)",
+        "pre_draft_no_age": "Pre-draft, no age (most prospects have no birth date)",
         "baseline_draft_capital": "Baseline (draft capital + position only)",
     }
     for variant, v in report["variants"].items():
@@ -199,6 +200,101 @@ def cmd_fit_prospect_model(args: argparse.Namespace) -> None:
         print(f"  {variant}: intercept {v['weights'][0]:+.3f}")
         for name, w in zip(v["features"], v["weights"][1:]):
             print(f"      {name:<16} {w:+.3f}")
+
+
+_BOARD_LEGEND = (
+    "\nDom: peak college dominator rating (share of team receiving yards and TDs). RecBreakout: age at the first "
+    "20%+ dominator season, receiving only, so it undersells a between-the-tackles RB; 'unknown' means no real "
+    "birth date, never estimated. Ath: this project's position-relative athletic score, needs 3+ combine tests. "
+    "FCalc: FantasyCalc's current dynasty value. Proj: projected PPG over the first 3 NFL seasons. League: Proj "
+    "after this league's position weighting (QB x0.70, WR x1.05), the ranking column."
+)
+
+
+def _breakout_label(row: dict) -> str:
+    if row["position"] == "QB":
+        return "-"
+    if row["breakout"] == "broke_out":
+        return f"at {row['breakout_age']:.1f}" if row.get("breakout_age") is not None else "yes"
+    return row["breakout"]
+
+
+def cmd_prospect_board(args: argparse.Namespace) -> None:
+    conn = get_db()
+    try:
+        if args.mode == "post-draft":
+            board = prospect_model.post_draft_board(conn, args.draft_class)
+        else:
+            board = prospect_model.pre_draft_board(conn, args.draft_class)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    rows = board["rows"][: args.limit]
+    if not rows:
+        print(
+            f"No {args.draft_class} prospects found. Post-draft mode needs that NFL draft to have happened "
+            f"(`ingest-draft-data --force`); pre-draft mode needs the prior college season (`ingest-college`).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    def fmt(value, spec, missing="-"):
+        return format(value, spec) if value is not None else missing
+
+    if board["mode"] == "post_draft":
+        m = board["model"]
+        print(f"{args.draft_class} rookie board, POST-DRAFT: ranked by draft capital and position.")
+        print(
+            f"Model: fitted on the {m['training_classes']} classes, projects PPG per game scheduled over the first "
+            f"3 NFL seasons, your league's scoring. Held-out error {m['cv_mae']:.2f} PPG, R^2 {m['cv_r2']:.2f}."
+        )
+        print(
+            "College production, age, and athleticism are shown for context only: tested on the same classes, "
+            "they did not improve the ranking once draft capital was known.\n"
+        )
+        header = (
+            f"{'#':>3} {'Player':<24} {'Pos':<3} {'Team':<4} {'Pick':>5} {'Age':>5} {'Dom':>5} {'RecBreakout':<14} "
+            f"{'Ath':>4} {'FCalc':>6} {'Proj':>5} {'League':>6}"
+        )
+        print(header)
+        print("-" * len(header))
+        for i, r in enumerate(rows, 1):
+            print(
+                f"{i:>3} {r['name'][:24]:<24} {r['position']:<3} {r['nfl_team'] or '':<4} "
+                f"{r['round']}.{r['pick']:<3} {fmt(r['draft_age'], '5.1f'):>5} "
+                f"{('-' if r['position'] == 'QB' else fmt(r['peak_dominator'], '5.2f')):>5} "
+                f"{_breakout_label(r):<14} {fmt(r['athletic'], '4.0f'):>4} {fmt(r['market_value'], '6.0f'):>6} "
+                f"{r['projected_ppg']:>5.1f} {r['league_ppg']:>6.1f}"
+            )
+        print(_BOARD_LEGEND)
+    else:
+        with_age, no_age = board["models"]["pre_draft"], board["models"]["pre_draft_no_age"]
+        print(f"{args.draft_class} class, PRE-DRAFT: WEAK SIGNAL, a first read before the NFL draft order exists.")
+        print(
+            f"Ranked on college production through the {board['last_college_season']} season. Held-out accuracy is low: "
+            f"R^2 {with_age['cv_r2']:.2f} with a real birth date, {no_age['cv_r2']:.2f} without one (most prospects). "
+            f"Draft capital explains far more; switch to --mode post-draft once the NFL draft happens."
+        )
+        print(
+            f"Eligibility is estimated as 3+ college seasons on record, real declarations are unknown until January. "
+            f"A season counts only with {prospect_model.MIN_TEAM_GAMES}+ team games and "
+            f"{prospect_model.MIN_PLAYER_GAMES}+ player games in ESPN's data, so an in-progress season joins once it "
+            f"gets there; {board['skipped_thin_sample']} players had no qualifying season and are left off.\n"
+        )
+        header = (
+            f"{'#':>3} {'Player':<24} {'Pos':<3} {'Seasons':>7} {'Games':>5} {'Age':>5} {'Dom':>5} "
+            f"{'RecBreakout':<14} {'Proj':>5} {'League':>6}"
+        )
+        print(header)
+        print("-" * len(header))
+        for i, r in enumerate(rows, 1):
+            print(
+                f"{i:>3} {r['name'][:24]:<24} {r['position']:<3} {r['college_seasons']:>7} {r['games_last_season']:>5} "
+                f"{fmt(r['draft_age'], '5.1f', 'n/a'):>5} "
+                f"{('-' if r['position'] == 'QB' else format(r['peak_dominator'], '5.2f')):>5} "
+                f"{_breakout_label(r):<14} {r['projected_ppg']:>5.1f} {r['league_ppg']:>6.1f}"
+            )
+        print(_BOARD_LEGEND)
 
 
 def _latest_ingested_season(conn) -> int | None:
@@ -657,6 +753,16 @@ def main() -> None:
         "fit-prospect-model",
         help="[Phase 4] Fit the rookie prospect model against real 2018-2023 draft class outcomes and report its accuracy.",
     ).set_defaults(func=cmd_fit_prospect_model)
+
+    board_parser = sub.add_parser(
+        "prospect-board",
+        help="[Phase 4] Ranked rookie board. post-draft: after the NFL draft, ranked by draft capital. "
+        "pre-draft: before it, ranked on college production, a WEAK signal, labeled as such.",
+    )
+    board_parser.add_argument("--mode", choices=["post-draft", "pre-draft"], required=True)
+    board_parser.add_argument("--class", dest="draft_class", type=int, required=True, help="NFL draft year, e.g. 2027.")
+    board_parser.add_argument("--limit", type=int, default=40, help="How many players to show (default 40).")
+    board_parser.set_defaults(func=cmd_prospect_board)
 
     valuate_parser = sub.add_parser(
         "valuate",
