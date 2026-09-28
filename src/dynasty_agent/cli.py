@@ -7,7 +7,7 @@ import json
 import sys
 from datetime import datetime
 
-from dynasty_agent import blend, college, config, market, matchup, nflverse, picks, prospect_model, prospects, refresh, schedule, sleeper, valuation, weather, weekly
+from dynasty_agent import blend, college, config, market, matchup, nflverse, picks, prospect_model, prospects, refresh, schedule, sleeper, taxi, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -388,6 +388,63 @@ def cmd_picks(args: argparse.Namespace) -> None:
         f"\nYour posture: {verdict['verdict'].upper()} ({verdict['confidence']}). "
         f"A contender sells picks for win-now help; a rebuilder holds or buys them."
     )
+
+
+def cmd_taxi(args: argparse.Namespace) -> None:
+    _require_config()
+    conn = get_db()
+    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
+    if roster is None:
+        print("No roster found for this user. Run `dynasty-agent refresh` first.", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        result = taxi.plan(conn, _latest_ingested_season(conn), roster["roster_id"])
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    st = result["settings"]
+    deadline = f"taxi deadline week {st['taxi_deadline']}" if st["taxi_deadline"] else "no taxi deadline (moves allowed all season)"
+    eligible = "rookies or veterans" if st["taxi_allow_vets"] else "rookies only"
+    print(
+        f"Taxi and IR plan. Your league: {st['taxi_slots']} taxi slots, {eligible}, {st['taxi_years']} year max, "
+        f"{deadline}; {st['reserve_slots']} IR slot. Taxi players can't be started.\n"
+    )
+    print(
+        f"Active roster: {result['active_count']} of {result['active_capacity']}. "
+        f"Taxi: {len(result['taxi_now'])} of {st['taxi_slots']} used. IR: {len(result['ir_now'])} of {st['reserve_slots']} used."
+    )
+    if result["moves"]:
+        print(f"\nRecommended moves, each frees a bench spot ({result['bench_spots_freed']} total):")
+        for m in result["moves"]:
+            p = m["player"]
+            print(
+                f"  {p['full_name']:<22} {p['position']:<3} -> {m['to']:<4}  {p['ppg']:.1f} PPG, "
+                f"3yr value {p['three_year_value']:.1f}: {m['why']}"
+            )
+        print("  Make these in the Sleeper app, this tool can't change your roster (Sleeper's API is read-only).")
+    else:
+        print("\nNo moves: every open taxi and IR slot is either filled or has no eligible player to put there.")
+    for p in result["keep_active"]:
+        print(f"  Keep {p['full_name']} active: taxi-eligible, but he's in your best lineup right now.")
+
+    print(f"\nNext season ({result['next_draft']} rookie draft):")
+    print(
+        f"  You hold {result['next_picks']} picks in that draft. Today's taxi players graduate back to the active roster; "
+        f"the new rookies can take the taxi slots. Projected: {result['roster_next']} players for {result['capacity_next']} spots."
+    )
+    if result["overflow"] > 0:
+        if result["cut_candidates"]:
+            print(f"  Roster crunch: {result['overflow']} cut(s) needed. Lowest three-year value among non-rookie non-starters:")
+            for p in result["cut_candidates"]:
+                print(f"    {p['full_name']:<22} {p['position']:<3} 3yr value {p['three_year_value']:.1f}")
+        else:
+            print(
+                f"  Roster crunch: {result['overflow']} cut(s) needed, and every non-rookie on your roster starts, "
+                f"so the cut would come from your lineup or a rookie."
+            )
+        print("  Or trade picks away before the draft; see `dynasty-agent picks`.")
+    else:
+        print("  No crunch: everyone fits, before any waiver adds between now and then.")
 
 
 def cmd_schedule(args: argparse.Namespace) -> None:
@@ -954,6 +1011,12 @@ def main() -> None:
     )
     picks_parser.add_argument("--all", action="store_true", help="Every team's picks, not just yours.")
     picks_parser.set_defaults(func=cmd_picks)
+
+    sub.add_parser(
+        "taxi",
+        help="[Phase 4] Which players to move to taxi or IR now to free bench spots, and whether next year's rookie "
+        "draft forces a cut.",
+    ).set_defaults(func=cmd_taxi)
 
     schedule_parser = sub.add_parser(
         "schedule",
