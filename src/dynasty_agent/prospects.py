@@ -33,6 +33,7 @@ from pathlib import Path
 
 import duckdb
 
+from dynasty_agent import ids
 from dynasty_agent.config import NFLVERSE_CACHE_DIR
 from dynasty_agent.db import utcnow
 from dynasty_agent.nflverse import download
@@ -189,9 +190,14 @@ def ingest_combine(conn: sqlite3.Connection, force: bool = False) -> int:
 
 
 def ingest_draft_data(conn: sqlite3.Connection, force: bool = False) -> str:
-    """Ingest both nflverse draft_picks and combine. Returns a human-readable
-    summary. Both are whole-history files, there is no season to check for
-    availability the way nflverse.ingest_season does."""
+    """Ingest nflverse draft_picks and combine plus the player id crosswalk
+    (ids.py). Returns a human-readable summary. All are whole-history files,
+    there is no season to check for availability the way
+    nflverse.ingest_season does."""
     pick_rows = ingest_draft_picks(conn, force=force)
     combine_rows = ingest_combine(conn, force=force)
-    return f"Ingested {pick_rows} real NFL draft picks and {combine_rows} combine testing rows."
+    id_rows = ids.ingest_player_ids(conn, force=force)
+    return (
+        f"Ingested {pick_rows} real NFL draft picks, {combine_rows} combine testing rows, "
+        f"and {id_rows} player id crosswalk rows."
+    )

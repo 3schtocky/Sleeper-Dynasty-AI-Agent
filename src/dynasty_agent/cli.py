@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import config, market, matchup, nflverse, prospects, sleeper, valuation, weather, weekly
+from dynasty_agent import college, config, market, matchup, nflverse, prospects, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -159,6 +159,16 @@ def cmd_ingest_nflverse(args: argparse.Namespace) -> None:
 def cmd_ingest_draft_data(args: argparse.Namespace) -> None:
     conn = get_db()
     print(prospects.ingest_draft_data(conn, force=args.force))
+
+
+def cmd_ingest_college(args: argparse.Namespace) -> None:
+    conn = get_db()
+    last = args.through or args.season
+    if last < args.season:
+        print("--through must be the same season as --season or later.", file=sys.stderr)
+        raise SystemExit(1)
+    for season in range(args.season, last + 1):
+        print(college.ingest_season(conn, season, force=args.force))
 
 
 def _latest_ingested_season(conn) -> int | None:
@@ -601,6 +611,17 @@ def main() -> None:
         "--force", action="store_true", help="Re-download even if already cached, to pick up nflverse's latest update."
     )
     ingest_draft_parser.set_defaults(func=cmd_ingest_draft_data)
+
+    college_parser = sub.add_parser(
+        "ingest-college",
+        help="[Phase 4] Cache and ingest college production (ESPN box scores via sportsdataverse) for a season or a range.",
+    )
+    college_parser.add_argument("--season", type=int, required=True, help="First (or only) college season to ingest.")
+    college_parser.add_argument("--through", type=int, default=None, help="Last season, to ingest a range, e.g. 2008 through 2025.")
+    college_parser.add_argument(
+        "--force", action="store_true", help="Re-download even if cached, needed for the in-progress college season."
+    )
+    college_parser.set_defaults(func=cmd_ingest_college)
 
     valuate_parser = sub.add_parser(
         "valuate",
