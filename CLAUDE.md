@@ -6,11 +6,11 @@ A dynasty fantasy football agent for a single Sleeper league. It evaluates trade
 
 Phases 0 through 3 are built and verified against live data, and a full audit (Phase 3.5 in `PLANNING.md`) fixed the real bugs it found. Phase 4 (rookie draft prep) is in progress: the nflverse draft-capital/combine data layer is built and live-verified, but the actual prospect board is not built yet. College production (dominator rating, breakout age) has no confirmed data source: the College Football Data API was considered and rejected by request, it requires an email to register; no keyless, free, structured alternative has been confirmed yet, that's a real open question, see `PLANNING.md`. `PLANNING.md` is the build log, every methodology decision, real bug found and fixed, and live-verification result lives there; this file stays the reference doc, read `PLANNING.md` for the "why" behind a specific number.
 
-Commands that exist today: `init`, `sync`, `roster`, `ingest-nflverse`, `ingest-draft-data` (Phase 4 data layer only), `valuate`, `trade`, `predict-matchup` (draft, not calibrated, see its own status note in `PLANNING.md`), `optimize-lineup`, `faab`, `digest`. `README.md` has usage for each; `WINDOWS.md` has the PowerShell equivalents.
+Commands that exist today: `init`, `sync`, `refresh` (everything current, by calendar), `schedule` (daily `refresh` via macOS launchd), `roster`, `ingest-nflverse`, `ingest-draft-data`, `ingest-college`, `fit-prospect-model`, `prospect-board`, `calibrate-blend`, `valuate`, `trade`, `predict-matchup` (draft, not calibrated, see its own status note in `PLANNING.md`), `optimize-lineup`, `faab`, `digest`. `README.md` has usage for each; `WINDOWS.md` has the PowerShell equivalents.
 
 ## Environment
 
-- Developed on a MacBook Air M4, 16GB RAM, macOS. The tool itself is not macOS-only: audited directly for OS-specific assumptions (no subprocess calls, no hardcoded POSIX paths, `pathlib.Path` throughout) and runs identically on Windows, see `WINDOWS.md`.
+- Developed on a MacBook Air M4, 16GB RAM, macOS. The tool itself is not macOS-only: audited directly for OS-specific assumptions (no subprocess calls, no hardcoded POSIX paths, `pathlib.Path` throughout) and runs identically on Windows, see `WINDOWS.md`. One deliberate exception: `schedule` calls macOS's `launchctl`, isolated in `schedule.py` and refusing cleanly elsewhere; Windows uses Task Scheduler instead.
 - Python 3.12, managed with `uv`. Run everything through `uv run`, add dependencies with `uv add`.
 - SQLite for persistent storage. DuckDB for analytical queries over play-by-play data.
 - No GPU work and no local models. Every model call hits an API.
@@ -57,7 +57,7 @@ Work in phases. Do not skip ahead. Stop at the end of each phase, show what got 
 
 ## Working rules
 
-- At the start of every session, including a resumed one, run `dynasty-agent sync` before anything else. Nothing here gets reasoned about from a stale cache.
+- At the start of every session, including a resumed one, run `dynasty-agent refresh` before anything else (it includes `sync`). Nothing here gets reasoned about from a stale cache.
 - Ask before assuming. If a data source or intent is unclear, ask rather than guess.
 - Every recommendation shows its inputs. The goal is an auditable chain of reasoning, not a bare verdict.
 - State what is unknown. Snap share and route participation are partly paywalled at PFF and Fantasy Points. An estimate built from public data gets labeled as an estimate.

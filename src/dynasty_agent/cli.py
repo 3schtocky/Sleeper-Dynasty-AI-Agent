@@ -7,7 +7,7 @@ import json
 import sys
 from datetime import datetime
 
-from dynasty_agent import blend, college, config, market, matchup, nflverse, prospect_model, prospects, refresh, sleeper, valuation, weather, weekly
+from dynasty_agent import blend, college, config, market, matchup, nflverse, prospect_model, prospects, refresh, schedule, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -318,6 +318,19 @@ def cmd_refresh(args: argparse.Namespace) -> None:
     failed = [r for r in results if not r["ok"]]
     print(f"\n{len(results) - len(failed)} of {len(results)} steps ok, {(datetime.now() - started).seconds}s.")
     if failed:
+        raise SystemExit(1)
+
+
+def cmd_schedule(args: argparse.Namespace) -> None:
+    try:
+        if args.install:
+            print(schedule.install(*schedule.parse_time(args.at)))
+        elif args.remove:
+            print(schedule.remove())
+        else:
+            print(schedule.status())
+    except (RuntimeError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
 
@@ -864,6 +877,16 @@ def main() -> None:
     )
     refresh_parser.add_argument("--verbose", action="store_true", help="Print full tracebacks for failed steps.")
     refresh_parser.set_defaults(func=cmd_refresh)
+
+    schedule_parser = sub.add_parser(
+        "schedule",
+        help="Run `refresh` automatically every day (macOS launchd). No flags: show the current schedule and last run.",
+    )
+    schedule_group = schedule_parser.add_mutually_exclusive_group()
+    schedule_group.add_argument("--install", action="store_true", help="Schedule a daily refresh (see --at).")
+    schedule_group.add_argument("--remove", action="store_true", help="Remove the daily refresh.")
+    schedule_parser.add_argument("--at", default="06:00", help="24-hour local time for --install (default 06:00).")
+    schedule_parser.set_defaults(func=cmd_schedule)
 
     calibrate_parser = sub.add_parser(
         "calibrate-blend",

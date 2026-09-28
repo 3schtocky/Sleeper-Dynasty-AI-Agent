@@ -17,9 +17,15 @@ It is built for **one specific league shape**: 12 teams, 1QB, full PPR, no TE pr
 - **`optimize-lineup`** — the starting lineup, out of your real roster, that maximizes win probability against your actual Sleeper opponent for a given week, not raw projected points. Reports the highest-raw-points lineup alongside for comparison, since they can differ.
 - **`faab`** — a sized FAAB bid for one waiver target, against your real remaining budget, real weeks left before the playoffs, and how that target's real win-now value compares to everyone else actually available right now.
 - **`digest`** — the weekly brief: recommended lineup and win probability, real wind flags for your starters' games, top bench options, and sized suggestions for the best available waiver targets, all in one command.
-- **`ingest-draft-data`** *(Phase 4, in progress)* — caches real NFL draft picks and combine testing results (nflverse's `draft_picks`/`combine`, whole-history files). Data layer only; there's no ranked prospect board command yet.
+- **`refresh`** — brings everything current in one run, by time of year: Sleeper and FantasyCalc always; this season's NFL stats, lines, and matchups in season; college stats August to January; draft and combine data February to May; the prospect model refit when a new draft class completes 3 NFL seasons. Ends with how old each source is. Run it first, or let `schedule` run it for you.
+- **`schedule`** *(macOS)* — runs `refresh` every day at a set time (default 06:00) through macOS's own launchd, logging to `data/logs/refresh.log`. A run missed while the Mac slept happens on wake. Windows: see `WINDOWS.md`.
+- **`ingest-draft-data`** — real NFL draft picks and combine testing (nflverse) plus a player id crosswalk (DynastyProcess and nflverse) linking Sleeper, ESPN, and Pro Football Reference ids.
+- **`ingest-college`** — college production from sportsdataverse's free ESPN college football data, with each team's conference and opponent-adjusted strength.
+- **`fit-prospect-model`** — fits the rookie model against how the 2018 through latest-complete draft classes actually scored in your league's format, and reports its held-out accuracy.
+- **`prospect-board`** *(Phase 4, in progress)* — a ranked rookie board. `--mode post-draft` ranks by draft capital (college production was tested and adds nothing once draft capital is known); `--mode pre-draft` ranks on college production and team context before the draft order exists, a weak signal labeled weak on every run.
+- **`calibrate-blend`** — reruns the backtest behind how much last season counts this season (see below).
 
-What it doesn't do yet: a ranked rookie prospect board. `ingest-draft-data` above is the first piece. The rest is blocked on two things: draft capital, landing spot, and athletic testing don't exist yet for this league's actual next rookie class (the 2027 NFL draft hasn't happened; confirmed live against nflverse's own data), and college production (dominator rating, breakout age) has no confirmed source: the College Football Data API was considered and rejected, it requires registering with an email. No keyless, free, structured source for real college production stats has been confirmed yet, that's an open question, not solved by picking a fallback silently. See `PLANNING.md` for the full detail.
+Still to come in Phase 4: buy, hold, or sell guidance on the picks you hold, and taxi-squad planning. See `PLANNING.md`.
 
 ## Requirements
 
@@ -56,13 +62,13 @@ If your league isn't 12-team/1QB/full-PPR, also set the `FANTASYCALC_NUM_QBS` / 
 ## Run it
 
 ```
-uv run dynasty-agent sync                          # your league, rosters, and market values
+uv run dynasty-agent refresh                        # everything current: league, values, this season's stats
 uv run dynasty-agent roster                         # sanity check: is this your team?
-uv run dynasty-agent ingest-nflverse --season 2025  # the most recently completed NFL season
-                                                    # the current season re-downloads automatically to pick up new weeks; --force does it for any season
 uv run dynasty-agent valuate                        # win-now/three-year value + the verdict
-uv run dynasty-agent ingest-draft-data               # Phase 4 data layer: real NFL draft picks + combine
+uv run dynasty-agent schedule --install             # optional, macOS: run refresh daily at 06:00 (--at to change)
 ```
+
+First run on a new machine, before `refresh` has anything to build on: `sync`, then `ingest-nflverse --season <last completed season>`, `ingest-draft-data`, `ingest-college --season 2008 --through <current season>`, and `fit-prospect-model`. After that, `refresh` keeps it all current. Each ingest command still works on its own; `ingest-nflverse` re-downloads the current season automatically and takes `--force` for any other.
 
 Evaluate a trade, players by name (fuzzy-matched) or Sleeper `player_id`, picks as `<season>-<round>`:
 
@@ -109,6 +115,7 @@ Every command reruns fresh against whatever's cached in `data/` (git-ignored, lo
 
 ## How the numbers work, briefly
 
+- **This season and last, blended**: every per-game average starts from last season's (worth 4 games) and this season's real games add on top, so a new season takes over as it accumulates instead of all at once. A rookie starts from his draft-capital projection instead (worth 3 games). Both weights were chosen by backtest against real outcomes (`calibrate-blend`), not by feel.
 - **Fantasy points** come from your league's real `scoring_settings`, pulled live from the Sleeper API, not a hardcoded PPR formula.
 - **Age curve**: flat at full value through a position's peak, then an exponential decay past it, tuned per position (see `metrics.AGE_CURVES`).
 - **Situation score**: a team's QB passing EPA, pass rate over expected, and sack rate allowed (inverted, a public proxy for offensive line quality), each percentile-ranked against all 32 NFL teams and averaged.

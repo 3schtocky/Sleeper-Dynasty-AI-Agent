@@ -134,6 +134,16 @@ Before the NFL draft, college production is the only signal, kept by request as 
 ### Acceptance test
 A ranked prospect board for the next rookie draft, with a recommendation on any picks currently held. Not built yet; `ingest-draft-data` is the data layer underneath it.
 
+## Staying current in season
+
+Found by asking "will this stay up to date?": it didn't. Nothing ran on its own, the 2026 season's stats sat un-ingested three weeks in, and ingesting them would have switched every value from 17 games of 2025 to 3 noisy games of 2026 in one step.
+
+- [x] **Blend, don't switch.** Every per-game average (valuations, matchups, lineups) starts from last season's and this season's real games add on top; team situation scores blend the same way by games played. A rookie starts from his draft-capital projection instead. How much the prior counts was chosen by backtest (`calibrate-blend`, `blend.py`): blend the prior with the first 1-8 weeks, score against the rest of the season. Veterans, 2024 into 2025, 1,231 players: best at 4 games (MAE 0.883 PPG against 1.082 for this season alone; flat from 3 to 6). Rookies, the 2025 class, outside the model's training range, 71 players: best at 3 games (3.032 against 3.454). One season pair each, rerun as more accumulate. Verified live on 2026 through week 3: CeeDee Lamb 19.0 PPG and Rashee Rice 16.1, blending 3 real games into last season; the user's rookies moving off their projections (Emmett Johnson 4.4 after 3 games).
+- [x] **`refresh`**: one command that knows the calendar (see `refresh.py`), each step independent so one failure doesn't stop the rest, ending in a freshness report. The prospect model's training window now moves forward on its own (2018 through the newest class with 3 completed seasons) and refits when it does. 3-4 seconds on a live run.
+- [x] **`schedule`**: a daily `refresh` through launchd, verified by triggering the installed job through launchd itself (its stripped-down environment, not a terminal): 5 of 5 steps ok. Windows gets the `schtasks` equivalent in `WINDOWS.md`, written from Microsoft's documented syntax, not yet run on Windows.
+- [x] **Real bug found on the way**: `ingest-nflverse` crashed for every season before 2025. nflverse's depth chart format changed in 2025 (dated snapshots, `pos_abb`); older seasons are week-numbered (`club_code`, `depth_team`). Both handled now, 2024 verified.
+- [x] **Found live, reported to the user**: Jonah Coleman is on IR in Sleeper as of week 4.
+
 ## Out-of-band: ad hoc matchup prediction — DRAFT
 
 Not part of the phase plan, added on request: `dynasty-agent predict-matchup` (`src/dynasty_agent/matchup.py`) estimates win probability between any two arbitrary rosters, not necessarily this league or even a dynasty league. Grew out of manually answering a one-off "who wins this weekend" question by hand.

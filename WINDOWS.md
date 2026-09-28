@@ -75,11 +75,20 @@ then open `.env` in Notepad (or any editor) and fill in the four values. Your le
 ## 5. Run it
 
 ```powershell
-uv run dynasty-agent sync                          # your league, rosters, and market values
+uv run dynasty-agent refresh                        # everything current: league, values, this season's stats
 uv run dynasty-agent roster                         # sanity check: is this your team?
-uv run dynasty-agent ingest-nflverse --season 2025  # the most recently completed NFL season
 uv run dynasty-agent valuate                        # win-now/three-year value + the verdict
 ```
+
+First run on a new machine: `sync`, `ingest-nflverse --season <last completed season>`, `ingest-draft-data`, `ingest-college --season 2008 --through <current season>`, then `fit-prospect-model`; see the main README.
+
+**Daily refresh.** `dynasty-agent schedule` uses macOS's launchd and tells you so on Windows. The Windows equivalent is one Task Scheduler command, run once from the project folder (written from Microsoft's documented `schtasks` syntax, not yet run on a Windows machine for this project):
+
+```powershell
+schtasks /Create /SC DAILY /ST 06:00 /TN "dynasty-agent refresh" /TR "cmd /c cd /d $PWD && uv run dynasty-agent refresh >> data\logs\refresh.log 2>&1"
+```
+
+Remove it with `schtasks /Delete /TN "dynasty-agent refresh" /F`.
 
 Evaluate a trade. PowerShell line continuation is a backtick (`` ` ``) at the very end of the line, not the backslash (`\`) you'd use in Bash, and it has to be the *last* character on the line, no trailing space after it or PowerShell won't recognize it:
 
