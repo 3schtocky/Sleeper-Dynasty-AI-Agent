@@ -291,6 +291,14 @@ def derive_depth_chart_weekly(conn: sqlite3.Connection, season: int) -> int:
 
     con = duckdb.connect()
     try:
+        columns = {c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(depth_path)]).fetchall()}
+    finally:
+        con.close()
+    if "pos_abb" not in columns:
+        return _derive_week_numbered_depth_chart(conn, season, depth_path)
+
+    con = duckdb.connect()
+    try:
         week_start_rows = con.execute(
             "SELECT week, MIN(game_date) FROM read_parquet(?) GROUP BY week ORDER BY week",
             [str(pbp_path)],
@@ -334,6 +342,43 @@ def derive_depth_chart_weekly(conn: sqlite3.Connection, season: int) -> int:
     )
     conn.commit()
     return len(upsert_rows)
+
+
+def _derive_week_numbered_depth_chart(conn: sqlite3.Connection, season: int, depth_path: Path) -> int:
+    """nflverse's depth chart format before 2025: already one chart per
+    week (club_code, week, depth_team), no snapshot dates to map. Found when
+    ingesting 2024 crashed on the 2025-format query: every season before
+    2025 uses this shape. snapshot_dt, a real date in the newer format,
+    holds a "<season>-week-NN" label here, there is no date to record."""
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            """
+            SELECT week, club_code, full_name, gsis_id, position, try_cast(depth_team AS INTEGER)
+            FROM read_parquet(?)
+            WHERE formation = 'Offense' AND game_type = 'REG' AND week IS NOT NULL
+              AND position IN ('QB', 'RB', 'WR', 'TE', 'FB') AND gsis_id IS NOT NULL
+            """,
+            [str(depth_path)],
+        ).fetchall()
+    finally:
+        con.close()
+    fetched_at = utcnow()
+    conn.executemany(
+        """
+        INSERT INTO depth_chart_weekly (season, week, team, gsis_id, player_name, pos_abb, pos_rank, snapshot_dt, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (season, week, team, pos_abb, gsis_id) DO UPDATE SET
+            pos_rank = excluded.pos_rank, player_name = excluded.player_name,
+            snapshot_dt = excluded.snapshot_dt, fetched_at = excluded.fetched_at
+        """,
+        [
+            (str(season), week, team, gsis_id, name, pos, rank, f"{season}-week-{week:02d}", fetched_at)
+            for week, team, name, gsis_id, pos, rank in rows
+        ],
+    )
+    conn.commit()
+    return len(rows)
 
 
 def ingest_season(conn: sqlite3.Connection, season: int, scoring_settings: dict, force: bool = False) -> str:

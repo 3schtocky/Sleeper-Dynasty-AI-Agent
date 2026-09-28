@@ -157,7 +157,8 @@ def project_player(
     if row is None:
         return None
 
-    raw_mean, raw_variance, games = player_weekly_distribution(conn, player_id, stats_season)
+    dist = player_weekly_distribution(conn, player_id, stats_season)
+    raw_mean, raw_variance, games = dist["mean"] or 0.0, dist["variance"], dist["current_games"]
     injury_mean = injury_adjusted_mean(raw_mean, row["injury_status"])
     injury_variance = injury_adjusted_variance(raw_variance, row["injury_status"]) if raw_variance is not None else 0.0
 
@@ -177,6 +178,8 @@ def project_player(
         "team": row["team"],
         "injury_status": row["injury_status"],
         "games": games,
+        "prior_games": dist["prior_games"],
+        "value_source": dist["source"],
         "on_bye": on_bye,
         "vegas_multiplier": vegas_mult,
         "mean": mean,

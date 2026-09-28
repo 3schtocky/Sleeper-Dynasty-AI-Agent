@@ -20,8 +20,9 @@ import json
 import sqlite3
 
 import duckdb
+import httpx
 
-from dynasty_agent import market, nflverse
+from dynasty_agent import blend, market, nflverse
 from dynasty_agent.prospect_model import rookie_projections
 from dynasty_agent.metrics import (
     best_lineup_total,
@@ -87,6 +88,15 @@ def team_situation_scores(season: int) -> dict[str, dict]:
             """,
             [str(pbp_path)],
         ).fetchall()
+        games_rows = con.execute(
+            """
+            SELECT posteam AS team, count(DISTINCT game_id) AS games
+            FROM read_parquet(?)
+            WHERE season_type = 'REG' AND posteam IS NOT NULL
+            GROUP BY posteam
+            """,
+            [str(pbp_path)],
+        ).fetchall()
         sack_rows = con.execute(
             """
             SELECT posteam AS team,
@@ -100,6 +110,7 @@ def team_situation_scores(season: int) -> dict[str, dict]:
     finally:
         con.close()
 
+    team_games = dict(games_rows)
     qb_epa = dict(qb_rows)
     pass_rate = dict(pass_rate_rows)
     ol_pass_pro = {team: (1 - rate) if rate is not None else None for team, rate in sack_rows}
@@ -119,74 +130,83 @@ def team_situation_scores(season: int) -> dict[str, dict]:
             "pass_rate_percentile": pass_pct,
             "ol_pass_pro_percentile": ol_pct,
             "situation_score": (qb_pct + pass_pct + ol_pct) / 3.0,
+            "games": team_games.get(team, 0),
         }
     return result
 
 
 def player_valuations(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
     """One valuation per player with a players-table entry and either real
-    weekly_stats rows this season or a prospect-model projection (a rookie,
-    see prospect_model.rookie_projections): production score, win-now
-    value, and three-year value, plus every input that fed them.
-    value_source says which: "nfl_stats" or "prospect_model"."""
+    weekly_stats rows this season or last, or a prospect-model projection
+    (a rookie, see prospect_model.rookie_projections): production score,
+    win-now value, and three-year value, plus every input that fed them.
 
-    situations = team_situation_scores(season)
+    Per-game production is blended (blend.player_distribution): last
+    season's average counts as a few games (blend.VETERAN_PRIOR_GAMES,
+    chosen by backtest) and this season's real games add on top, so a new
+    season takes over as it accumulates instead of all at once. A rookie's
+    prior is his projection. value_source says which prior: "nfl_stats" or
+    "prospect_model"."""
 
-    rows = conn.execute(
-        """
-        SELECT p.player_id, p.full_name, p.position, p.team, p.age,
-               avg(ws.fantasy_points) AS fppg, count(*) AS games
-        FROM players p
-        JOIN weekly_stats ws ON ws.player_id = p.player_id AND ws.season = ?
-        GROUP BY p.player_id
-        """,
-        (str(season),),
-    ).fetchall()
+    situations = blended_team_situations(season)
 
-    def value_row(row, fppg: float, games: int, source: dict) -> dict:
+    candidate_ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT ws.player_id FROM weekly_stats ws JOIN players p ON p.player_id = ws.player_id "
+            "WHERE ws.season IN (?, ?)",
+            (str(season), str(season - 1)),
+        )
+    ]
+    rookies = rookie_projections(conn, season)
+    ids = sorted(set(candidate_ids) | set(rookies))
+    rows = []
+    for chunk_start in range(0, len(ids), 900):
+        chunk = ids[chunk_start:chunk_start + 900]
+        rows += conn.execute(
+            f"SELECT player_id, full_name, position, team, age FROM players WHERE player_id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        ).fetchall()
+
+    result: dict[str, dict] = {}
+    for row in rows:
+        rookie = rookies.get(row["player_id"])
+        dist = blend.player_distribution(conn, row["player_id"], season, rookie=rookie)
+        if dist["mean"] is None:
+            continue
         team_situation = situations.get(to_nflverse_team(row["team"]), {}).get("situation_score", 50.0)
-        prod = production_score(fppg, row["position"])
-        return {
+        prod = production_score(dist["mean"], row["position"])
+        result[row["player_id"]] = {
             "full_name": row["full_name"],
             "position": row["position"],
             "team": row["team"],
             "age": row["age"],
-            "fantasy_points_per_game": fppg,
-            "games": games,
+            "fantasy_points_per_game": dist["mean"],
+            "games": dist["current_games"],
+            "prior_games": dist["prior_games"],
+            "prior_weight": dist["prior_weight"],
             "situation_score": team_situation,
             "production_score": prod,
             "win_now_value": win_now_value(prod, row["position"], row["age"], team_situation),
             "three_year_value": three_year_value(prod, row["position"], row["age"], team_situation),
-            **source,
+            "value_source": dist["source"],
+            **({"draft_pick": rookie["draft_pick"], "undrafted": rookie["undrafted"]} if rookie else {}),
         }
-
-    # Rookies and near-rookies with fewer than 4 games: the prospect model's
-    # draft-capital projection instead of a thin (or empty) sample. Before
-    # this, every rookie was valued at exactly 0, see PLANNING.md Phase 3.5.
-    rookies = rookie_projections(conn, season)
-
-    result: dict[str, dict] = {}
-    for row in rows:
-        if row["player_id"] in rookies:
-            continue
-        result[row["player_id"]] = value_row(row, row["fppg"], row["games"], {"value_source": "nfl_stats"})
-
-    if rookies:
-        placeholders = ",".join("?" * len(rookies))
-        rookie_rows = conn.execute(
-            f"SELECT player_id, full_name, position, team, age FROM players WHERE player_id IN ({placeholders})",
-            list(rookies),
-        ).fetchall()
-        for row in rookie_rows:
-            r = rookies[row["player_id"]]
-            games = conn.execute(
-                "SELECT count(*) FROM weekly_stats WHERE player_id = ? AND season = ?", (row["player_id"], str(season))
-            ).fetchone()[0]
-            result[row["player_id"]] = value_row(
-                row, r["projected_ppg"], games,
-                {"value_source": "prospect_model", "draft_pick": r["draft_pick"], "undrafted": r["undrafted"]},
-            )
     return result
+
+
+def blended_team_situations(season: int) -> dict[str, dict]:
+    """team_situation_scores for this season and last, blended by games
+    played (blend.blended_situations). A season nflverse hasn't published
+    yet simply contributes nothing."""
+
+    def scores(s: int) -> dict[str, dict]:
+        try:
+            return team_situation_scores(s)
+        except httpx.HTTPStatusError:
+            return {}
+
+    return blend.blended_situations(scores(season), scores(season - 1))
 
 
 def contend_or_rebuild(conn: sqlite3.Connection, season: int, my_roster_id: int) -> dict:

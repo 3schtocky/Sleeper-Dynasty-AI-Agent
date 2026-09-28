@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from dynasty_agent.metrics import (
     age_multiplier,
     compute_fantasy_points,
@@ -348,3 +350,32 @@ def test_best_lineup_total_superflex_takes_a_second_qb():
 def test_best_lineup_total_leaves_unfillable_slots_at_zero():
     assert best_lineup_total([("QB", 20)], ONE_FLEX) == 20
     assert best_lineup_total([], ONE_FLEX) == 0
+
+
+# -- season blending -------------------------------------------------------------
+
+from dynasty_agent.metrics import blended_mean, blended_variance  # noqa: E402
+
+
+def test_blended_mean_hand_calculation():
+    # Prior 20 PPG worth 4 games, then 8 and 12: (80 + 20) / 6.
+    assert blended_mean(20.0, 4, [8.0, 12.0]) == pytest.approx(100.0 / 6)
+
+
+def test_blended_mean_edges():
+    assert blended_mean(20.0, 4, []) == 20.0  # no games yet: the prior
+    assert blended_mean(None, 4, [8.0, 12.0]) == 10.0  # no prior: this season alone
+    assert blended_mean(None, 4, []) is None
+    assert blended_mean(20.0, 0, []) == 20.0  # zero-weight prior, no games: never divides by zero
+
+
+def test_blended_variance_matches_plain_sample_variance_when_weights_are_one():
+    values = [4.0, 8.0, 6.0, 10.0]
+    assert blended_variance([], 0.0, values) == pytest.approx(20.0 / 3)
+    # Two prior games sharing weight 2 is weight 1 each: the same as pooling them.
+    assert blended_variance([4.0, 8.0], 2.0, [6.0, 10.0]) == pytest.approx(20.0 / 3)
+
+
+def test_blended_variance_is_none_without_a_sample():
+    assert blended_variance([], 0.0, []) is None
+    assert blended_variance([], 0.0, [5.0]) is None

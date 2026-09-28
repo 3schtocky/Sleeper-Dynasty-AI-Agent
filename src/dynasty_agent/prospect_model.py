@@ -524,19 +524,22 @@ def pre_draft_board(conn: sqlite3.Connection, draft_class: int, min_college_seas
 
 # -- rookie values inside the existing valuation ---------------------------------------
 
-# A player counts as a rookie for valuation when he has fewer than this many
-# games in the valuation season and at most one year of NFL experience.
-# Below 4 games, a sample mean says little (see metrics.sample_mean_variance),
-# and without this every rookie was valued at exactly 0.
-ROOKIE_MAX_GAMES = 4
+# A player's value starts from the prospect model's projection instead of
+# last season's stats when he has at most ROOKIE_MAX_YEARS_EXP years of
+# experience and fewer than ROOKIE_MAX_PRIOR_GAMES games last season, too
+# few to be a real prior. This season's games then blend in on top of the
+# projection (blend.ROOKIE_PRIOR_GAMES), so there is no cliff where a rookie
+# jumps from a projection to a 4-game average. Before any of this, every
+# rookie was valued at exactly 0.
+ROOKIE_MAX_PRIOR_GAMES = 4
 ROOKIE_MAX_YEARS_EXP = 1
 
 
-def rookie_projections(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
-    """{sleeper_id: projection} for every QB/RB/WR/TE on an NFL team with at
-    most ROOKIE_MAX_YEARS_EXP years of experience and fewer than
-    ROOKIE_MAX_GAMES games in `season`, from the draft-capital model (the
-    one that held up out of sample). Empty when no model is fitted yet.
+def rookie_projections(conn: sqlite3.Connection, season: int, player_ids: list[str] | None = None) -> dict[str, dict]:
+    """{sleeper_id: projection} for every QB/RB/WR/TE on an NFL team who
+    qualifies as a rookie for `season` (see ROOKIE_MAX_* above), optionally
+    limited to player_ids, from the draft-capital model (the one that held
+    up out of sample). Empty when no model is fitted yet.
 
     projected_ppg is points per game SCHEDULED over the first 3 NFL
     seasons, the model's own target, so it runs a little conservative next
@@ -545,17 +548,24 @@ def rookie_projections(conn: sqlite3.Connection, season: int) -> dict[str, dict]
     model = load_model(conn, "baseline_draft_capital")
     if model is None:
         return {}
+    only = ""
+    params: list = [ROOKIE_MAX_YEARS_EXP, str(season - 1), ROOKIE_MAX_PRIOR_GAMES]
+    if player_ids is not None:
+        if not player_ids:
+            return {}
+        only = f" AND p.player_id IN ({','.join('?' * len(player_ids))})"
+        params += list(player_ids)
     rows = conn.execute(
-        """
+        f"""
         SELECT p.player_id, p.position, d.pick
         FROM players p
         LEFT JOIN player_ids pi ON pi.sleeper_id = p.player_id
         LEFT JOIN nfl_draft_picks d ON d.gsis_id = pi.gsis_id AND pi.gsis_id IS NOT NULL
         WHERE p.position IN ('QB', 'RB', 'WR', 'TE') AND p.team IS NOT NULL
           AND coalesce(p.years_exp, 0) <= ?
-          AND (SELECT count(*) FROM weekly_stats w WHERE w.player_id = p.player_id AND w.season = ?) < ?
+          AND (SELECT count(*) FROM weekly_stats w WHERE w.player_id = p.player_id AND w.season = ?) < ?{only}
         """,
-        (ROOKIE_MAX_YEARS_EXP, str(season), ROOKIE_MAX_GAMES),
+        params,
     ).fetchall()
     result: dict[str, dict] = {}
     for r in rows:

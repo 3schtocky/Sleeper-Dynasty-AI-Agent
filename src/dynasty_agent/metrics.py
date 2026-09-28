@@ -420,3 +420,42 @@ def athletic_score(player: dict, population: list[dict]) -> tuple[float | None, 
     if len(percentiles) < MIN_ATHLETIC_TESTS:
         return None, len(percentiles)
     return sum(percentiles) / len(percentiles), len(percentiles)
+
+
+# -- blending last season into this one ---------------------------------------------
+
+
+def blended_mean(prior_mean: float | None, prior_weight_games: float, current_values: list[float]) -> float | None:
+    """A season-to-date average that starts at the prior (last season's
+    average, or a rookie's projection) and moves toward this season's real
+    games as they accumulate. The prior counts as prior_weight_games games:
+    (K * prior + sum(current)) / (K + n). With no prior, just this season's
+    mean; with neither, None. This replaces a hard switch from one season to
+    the next, which valued a veteran on 3 noisy weeks the moment a new
+    season was ingested."""
+    n = len(current_values)
+    if prior_mean is None:
+        return sum(current_values) / n if n else None
+    if prior_weight_games + n == 0:
+        return prior_mean  # a zero-weight prior and no games yet: the prior is still all there is
+    return (prior_weight_games * prior_mean + sum(current_values)) / (prior_weight_games + n)
+
+
+def blended_variance(prior_values: list[float], prior_weight_games: float, current_values: list[float]) -> float | None:
+    """Week-to-week variance over last season's games and this season's,
+    last season's games sharing prior_weight_games of total weight, this
+    season's games weight 1 each: the same weighting blended_mean uses.
+    Reliability-weighted and bias-corrected (sum w (x - mean)^2 / (V1 -
+    V2 / V1)), which reduces to the ordinary n - 1 sample variance when
+    every weight is 1. None when there's too little weight to estimate one."""
+    weighted: list[tuple[float, float]] = []
+    if prior_values:
+        w = prior_weight_games / len(prior_values)
+        weighted += [(x, w) for x in prior_values]
+    weighted += [(x, 1.0) for x in current_values]
+    v1 = sum(w for _, w in weighted)
+    v2 = sum(w * w for _, w in weighted)
+    if not weighted or v1 - v2 / v1 <= 0:
+        return None
+    mean = sum(w * x for x, w in weighted) / v1
+    return sum(w * (x - mean) ** 2 for x, w in weighted) / (v1 - v2 / v1)

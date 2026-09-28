@@ -306,16 +306,44 @@ def test_rookies_are_valued_from_the_prospect_model_not_zero(conn):
     assert v["udfa"]["fantasy_points_per_game"] == pytest.approx(10.0 + 0.5 - 2.0 * math.log(260))
 
 
-def test_a_rookie_with_a_real_sample_keeps_his_real_stats(conn):
+def test_a_rookies_projection_blends_into_his_real_games_with_no_cliff(conn):
+    import math
+    from dynasty_agent import blend
     add_baseline_model(conn, [10.0, 1.0, 0.5, -0.5, -2.0])
-    add_rookie(conn, "rb2", "RB", pick=40, games=5)  # 5 real games at 10.0 PPG
-    add_rookie(conn, "vet", "WR", pick=41, years_exp=4, games=0)  # not a rookie: no projection, absent
+    add_rookie(conn, "rb2", "RB", pick=40, games=5)  # 5 real games at 10.0 PPG in 2025
+    add_rookie(conn, "vet", "WR", pick=41, years_exp=4, games=0)  # not a rookie, no stats: absent
     v = valuation.player_valuations(conn, 2025)
-    assert v["rb2"]["value_source"] == "nfl_stats"
-    assert v["rb2"]["fantasy_points_per_game"] == 10.0
+    projection = 10.0 + 1.0 - 2.0 * math.log(40)
+    k = blend.ROOKIE_PRIOR_GAMES
+    assert v["rb2"]["value_source"] == "prospect_model"
+    assert v["rb2"]["fantasy_points_per_game"] == pytest.approx((k * projection + 5 * 10.0) / (k + 5))
     assert "vet" not in v
+
+
+def test_last_season_blends_into_this_season_by_games_played(conn):
+    from dynasty_agent import blend
+    add_player(conn, "wr", "WR", 20.0, games=10)  # 2025: 10 games at 20 PPG
+    conn.executemany(
+        "INSERT INTO weekly_stats (player_id, season, week, position, fantasy_points, fetched_at) VALUES ('wr', '2026', ?, 'WR', 8.0, 't')",
+        [(1,), (2,)],
+    )  # 2026: 2 games at 8 PPG
+    v = valuation.player_valuations(conn, 2026)["wr"]
+    k = blend.VETERAN_PRIOR_GAMES
+    assert v["fantasy_points_per_game"] == pytest.approx((k * 20.0 + 16.0) / (k + 2))
+    assert (v["games"], v["prior_games"], v["value_source"]) == (2, 10, "nfl_stats")
 
 
 def test_no_fitted_model_means_no_rookie_values_not_a_crash(conn):
     add_rookie(conn, "rb3", "RB", pick=10)
     assert "rb3" not in valuation.player_valuations(conn, 2025)
+
+
+def test_team_situations_blend_by_games_played():
+    from dynasty_agent import blend
+    current = {"KC": {"situation_score": 90.0, "games": 4}, "NE": {"situation_score": 40.0, "games": 3}}
+    prior = {"KC": {"situation_score": 50.0, "games": 17}, "LV": {"situation_score": 30.0, "games": 17}}
+    out = blend.blended_situations(current, prior)
+    w = 4 / (4 + blend.VETERAN_PRIOR_GAMES)
+    assert out["KC"]["situation_score"] == pytest.approx(w * 90.0 + (1 - w) * 50.0)
+    assert out["NE"]["situation_score"] == 40.0  # no prior: this season alone
+    assert out["LV"]["situation_score"] == 30.0  # no games yet this season: last season

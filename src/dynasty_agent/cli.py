@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import college, config, market, matchup, nflverse, prospect_model, prospects, sleeper, valuation, weather, weekly
+from dynasty_agent import blend, college, config, market, matchup, nflverse, prospect_model, prospects, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -301,6 +301,42 @@ def cmd_prospect_board(args: argparse.Namespace) -> None:
         print(_BOARD_LEGEND)
 
 
+def cmd_calibrate_blend(args: argparse.Namespace) -> None:
+    conn = get_db()
+    season = args.season or _latest_complete_season(conn)
+    try:
+        vets, n_vets = blend.backtest_veterans(conn, season - 1, season)
+        rookies, n_rookies = blend.backtest_rookies(conn, season)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    if not vets:
+        print(f"No data to backtest: ingest both {season - 1} and {season} first.", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"Backtest: blend a prior with the first 1-8 weeks of {season}, score against the rest of that season.")
+    print("How many games the prior should count as (K), mean absolute error in PPG, lower is better:\n")
+    for label, res, n, current in (
+        (f"Veterans ({season - 1} as the prior)", vets, n_vets, blend.VETERAN_PRIOR_GAMES),
+        (f"Rookies ({season} class, draft-capital projection as the prior)", rookies, n_rookies, blend.ROOKIE_PRIOR_GAMES),
+    ):
+        if not res:
+            print(f"  {label}: no cases.")
+            continue
+        best = min(res, key=res.get)
+        print(f"  {label}, {n} players: best K = {best:g} (MAE {res[best]:.3f}); in use K = {current:g}")
+        print("     " + "  ".join(f"K{k:g}={v:.3f}" for k, v in res.items()))
+    print("\nThe constants in use live in blend.py with the run they came from; change them there if a new season disagrees.")
+
+
+def _latest_complete_season(conn) -> int:
+    """The most recent NFL season with every regular-season week played."""
+    row = conn.execute("SELECT season, season_type FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    if row is None or row["season"] is None:
+        print("No synced NFL state. Run `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+    return int(row["season"]) - (0 if row["season_type"] == "off" else 1)
+
+
 def _latest_ingested_season(conn) -> int | None:
     row = conn.execute("SELECT max(season) FROM weekly_stats").fetchone()
     return int(row[0]) if row and row[0] is not None else None
@@ -322,7 +358,7 @@ def cmd_valuate(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
     valuations = valuation.player_valuations(conn, season)
-    print(f"Valuation basis: {season} season (most recently ingested nflverse data).")
+    print(_basis_line(season))
     print(
         "Situation score: average of QB passing EPA/game, team pass rate over expected, and sack rate "
         "allowed (inverted), each percentile-ranked against all 32 NFL teams. Not a full offensive line "
@@ -380,18 +416,28 @@ def cmd_valuate(args: argparse.Namespace) -> None:
 
 
 _ROOKIE_FOOTNOTE = (
-    "\n* Rookie: fewer than 4 NFL games, so FPPG is the prospect model's projection from real draft capital "
-    "(fit on 2018-2023 classes), not NFL production. It's points per game scheduled over a first 3 seasons, so it "
-    "runs a little conservative next to a veteran's per-game-played average. Run `prospect-board` for the inputs."
+    f"\n* Rookie: FPPG starts from the prospect model's projection from real draft capital (fit on 2018-2023 "
+    f"classes), worth {blend.ROOKIE_PRIOR_GAMES:g} games, with his real games this season blended in on top. The "
+    f"projection is points per game scheduled over a first 3 seasons, so it runs a little conservative next to a "
+    f"veteran's per-game-played average. Run `prospect-board` for the inputs."
 )
+
+
+def _basis_line(season: int) -> str:
+    return (
+        f"Valuation basis: the {season} season to date, blended with {season - 1}: last season's average counts as "
+        f"{blend.VETERAN_PRIOR_GAMES:g} games and each real {season} game adds on top (chosen by backtest, see "
+        f"`calibrate-blend`), so the new season takes over as it accumulates."
+    )
 
 
 def _rookie_note(v: dict) -> str:
     if v.get("value_source") != "prospect_model":
         return ""
+    games = f" + {v['games']} games" if v.get("games") else ""
     if v.get("undrafted"):
-        return "  * rookie, undrafted (priced as the last pick, outside the model's training data)"
-    return f"  * rookie, projected from pick {v['draft_pick']}"
+        return f"  * rookie, undrafted (priced as the last pick, outside the model's training data){games}"
+    return f"  * rookie, projected from pick {v['draft_pick']}{games}"
 
 
 def _parse_pick(spec: str) -> tuple[int, int]:
@@ -465,7 +511,8 @@ def cmd_trade(args: argparse.Namespace) -> None:
         if side["unpriced"]:
             print(f"  WARNING: no market price for {', '.join(side['unpriced'])}, counted as 0 in the market total above.")
 
-    print(f"Trade evaluation, {season} season basis, pick discount rate {args.discount_rate:.0%} per year.")
+    print(f"Trade evaluation, pick discount rate {args.discount_rate:.0%} per year.")
+    print(_basis_line(season))
     print(
         "Win-now and 3yr(mine) are this league's own formula, players only, picks can't help you win "
         "this year so they don't appear there. Market value is FantasyCalc's own pricing for players plus "
@@ -541,12 +588,14 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
                 print(f"  {p['full_name']:<20} {p['position'] or '':<4} {p['team'] or '':<4}   BYE WEEK, counted as 0")
                 continue
             flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
-            if p["games"] == 0:
-                data_note = "  NO DATA THIS SEASON"
-            elif p["thin_sample"]:
-                data_note = f"  only {p['games']} game, variance not estimable, counted as 0"
+            if p["value_source"] == "prospect_model":
+                data_note = f"  rookie: projection + {p['games']} games this season"
+            elif p["games"] == 0 and p["prior_games"] == 0:
+                data_note = "  NO DATA this season or last"
             else:
-                data_note = f"  over {p['games']} games"
+                data_note = f"  {p['games']} games this season + last season's {p['prior_games']}, blended"
+            if p["thin_sample"] and p["value_source"] != "prospect_model" and (p["games"] or p["prior_games"]):
+                data_note += ", variance not estimable, counted as 0"
             vegas_note = f", vegas x{p['vegas_multiplier']:.2f}" if p["vegas_multiplier"] != 1.0 else ""
             print(
                 f"  {p['full_name']:<20} {p['position'] or '':<4} {p['team'] or '':<4} "
@@ -787,6 +836,15 @@ def main() -> None:
     board_parser.add_argument("--class", dest="draft_class", type=int, required=True, help="NFL draft year, e.g. 2027.")
     board_parser.add_argument("--limit", type=int, default=40, help="How many players to show (default 40).")
     board_parser.set_defaults(func=cmd_prospect_board)
+
+    calibrate_parser = sub.add_parser(
+        "calibrate-blend",
+        help="Backtest how much last season (and a rookie's projection) should count against this season's games.",
+    )
+    calibrate_parser.add_argument(
+        "--season", type=int, default=None, help="Season to score against. Defaults to the latest complete one."
+    )
+    calibrate_parser.set_defaults(func=cmd_calibrate_blend)
 
     valuate_parser = sub.add_parser(
         "valuate",
