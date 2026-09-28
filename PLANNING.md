@@ -84,7 +84,15 @@ A full read of every module plus live checks against the real data files, done b
 
 ### Still open, flagged not fixed
 - Every player with no NFL stats, the whole rostered 2026 rookie class included, is valued at 0 win-now and 0 three-year. That skews `valuate`'s verdict and `trade`'s three-year numbers. Fixing it needs the prospect model, so it is Phase 4 step 6 below, not a patch here.
-- Not yet re-verified end to end against the real league: this audit ran on a fresh clone with no `.env`. `sync`, `valuate`, `trade` and `digest` need one live run each.
+- FAAB sizing doesn't discriminate at the top: on the live run below, all five `digest` targets got the same $25 bid (every one sits near the 100th percentile of what's available, so each maxes the value multiplier), and two of them were QBs for a roster already carrying two. Roster need isn't an input yet. Not changed here, it's a Phase 3 design question, not a bug.
+
+### Verified live against the real league, after the fixes
+Run 2026-09-28, NFL week 3, 2025 season as the valuation basis.
+- `sync`: clean. The new draft sync pulled the league's one draft so far (2026 startup, complete, 252 picks); `waiver_budget` read as the real 100.
+- `ingest-nflverse --season 2025`: 18,522 player-week rows and 122,691 depth chart rows.
+- `valuate`: clean on the new best-lineup scoring. Verdict unclear (win-now 38th percentile, three-year 46th, 2 games played). All three rostered 2026 rookies show "no 2025 games", the Phase 4 gap above, confirmed live.
+- `trade --send "Jonah Coleman" --send-pick 2028-2 --receive-pick 2027-1`: clean. 2027 1st priced against the live base season with exactly 0 arbitrage, as it should. The rookie shows 0 on this project's own model beside a real 1,922 FantasyCalc price, the same gap again.
+- `digest --week 4`: clean, about 1.3 seconds (7 to 47 seconds before the schedules file was cached locally). Recommended lineup win probability 87.2%.
 
 ## Phase 4: rookie draft prep
 
