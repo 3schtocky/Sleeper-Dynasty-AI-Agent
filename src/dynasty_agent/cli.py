@@ -7,7 +7,7 @@ import json
 import sys
 from datetime import datetime
 
-from dynasty_agent import blend, college, config, market, matchup, nflverse, prospect_model, prospects, refresh, schedule, sleeper, valuation, weather, weekly
+from dynasty_agent import blend, college, config, market, matchup, nflverse, picks, prospect_model, prospects, refresh, schedule, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -319,6 +319,75 @@ def cmd_refresh(args: argparse.Namespace) -> None:
     print(f"\n{len(results) - len(failed)} of {len(results)} steps ok, {(datetime.now() - started).seconds}s.")
     if failed:
         raise SystemExit(1)
+
+
+def cmd_picks(args: argparse.Namespace) -> None:
+    _require_config()
+    conn = get_db()
+    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
+    if roster is None:
+        print("No roster found for this user. Run `dynasty-agent refresh` first.", file=sys.stderr)
+        raise SystemExit(1)
+    stats_season = _latest_ingested_season(conn)
+    league = conn.execute("SELECT scoring_settings_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    try:
+        report = picks.pick_report(
+            conn, stats_season, roster["roster_id"], _latest_complete_season(conn),
+            json.loads(league["scoring_settings_json"]), None if args.all else roster["roster_id"],
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    names = {
+        r["roster_id"]: (r["team_name"] or r["display_name"] or f"roster {r['roster_id']}")
+        for r in conn.execute(
+            "SELECT ro.roster_id, u.display_name, u.team_name FROM rosters ro LEFT JOIN users u ON u.user_id = ro.owner_id"
+        )
+    }
+    me = roster["roster_id"]
+    weight = report["record_weight"]
+    print(f"Rookie picks, {'every team' if args.all else 'yours'}. Next draft: {report['next_draft']}.")
+    print(
+        f"{report['next_draft']} slots are PROJECTED reverse standings: roster strength (best-lineup win-now) blended "
+        f"toward real record, record weighted {weight:.0%} so far (games played / regular-season games). "
+        f"Later drafts can't be slotted yet."
+    )
+    print(
+        f"Advice compares FantasyCalc's price for the pick with FantasyCalc's current value for the "
+        f"{report['recent_class']} rookies taken at that same slot: pick more than {picks.SELL_ABOVE:.2f}x the "
+        f"player it bought last year = SELL, under {picks.BUY_BELOW:.2f}x = BUY. History: that slot's rookies since "
+        f"{prospect_model.FIRST_TRAINING_CLASS}, league-weighted PPG over 3 seasons and how often they hit "
+        f"{picks.HIT_LEAGUE_PPG:g}+ (a weekly flex starter).\n"
+    )
+    header = f"{'Pick':<14} {'Holder':<16} {'From':<16} {'FCalc':>6} {'Comp':>6} {'Ratio':>5}  {'Advice':<8} {'Hist PPG':>8} {'Hit%':>5}"
+    print(header)
+    print("-" * len(header))
+    for r in report["rows"]:
+        slot = r["projected_slot"] or "  -  "
+        label = f"{r['season']} {slot}" + (f" {r['tier'][0]}" if r["tier"] else "")
+        if not r["projected_slot"]:
+            label = f"{r['season']} rd {r['round']}"
+        hist = r["history"] or {}
+        fmt = lambda v, spec: format(v, spec) if v is not None else "-"
+        holder = names.get(r["owner_roster_id"], "?")[:16]
+        origin = "own" if r["original_roster_id"] == r["owner_roster_id"] else names.get(r["original_roster_id"], "?")[:16]
+        mark = "*" if r["owner_roster_id"] == me else " "
+        print(
+            f"{label:<14}{mark}{holder:<16} {origin:<16} {fmt(r['fantasycalc_price'], '6.0f'):>6} "
+            f"{fmt(r.get('comparable_value'), '6.0f'):>6} {fmt(r['ratio'], '5.2f'):>5}  {r['advice'][:8]:<8} "
+            f"{fmt(hist.get('mean_league_ppg'), '8.1f'):>8} {fmt(hist.get('hit_rate') * 100 if hist else None, '4.0f'):>4}%"
+        )
+    slotted = [r for r in report["rows"] if r.get("comparable_players")]
+    if slotted and not args.all:
+        print("\nComparables (the recent rookies each projected slot actually bought):")
+        for r in slotted:
+            print(f"  {r['season']} {r['projected_slot']}: {', '.join(r['comparable_players'])}")
+    verdict = valuation.contend_or_rebuild(conn, stats_season, me)
+    print(
+        f"\nYour posture: {verdict['verdict'].upper()} ({verdict['confidence']}). "
+        f"A contender sells picks for win-now help; a rebuilder holds or buys them."
+    )
 
 
 def cmd_schedule(args: argparse.Namespace) -> None:
@@ -877,6 +946,14 @@ def main() -> None:
     )
     refresh_parser.add_argument("--verbose", action="store_true", help="Print full tracebacks for failed steps.")
     refresh_parser.set_defaults(func=cmd_refresh)
+
+    picks_parser = sub.add_parser(
+        "picks",
+        help="[Phase 4] Your rookie picks: projected slot, what that slot has really returned, FantasyCalc's price, "
+        "and buy/hold/sell against the rookies that slot bought last year.",
+    )
+    picks_parser.add_argument("--all", action="store_true", help="Every team's picks, not just yours.")
+    picks_parser.set_defaults(func=cmd_picks)
 
     schedule_parser = sub.add_parser(
         "schedule",
