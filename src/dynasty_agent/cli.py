@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from dynasty_agent import college, config, market, matchup, nflverse, prospects, sleeper, valuation, weather, weekly
+from dynasty_agent import college, config, market, matchup, nflverse, prospect_model, prospects, sleeper, valuation, weather, weekly
 from dynasty_agent.db import get_db
 from dynasty_agent.sleeper import SleeperClient
 
@@ -169,6 +169,36 @@ def cmd_ingest_college(args: argparse.Namespace) -> None:
         raise SystemExit(1)
     for season in range(args.season, last + 1):
         print(college.ingest_season(conn, season, force=args.force))
+
+
+def cmd_fit_prospect_model(args: argparse.Namespace) -> None:
+    conn = get_db()
+    league = conn.execute("SELECT scoring_settings_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    if league is None:
+        print("No league data cached yet. Run `dynasty-agent sync` first.", file=sys.stderr)
+        raise SystemExit(1)
+    report = prospect_model.fit_and_store(conn, json.loads(league["scoring_settings_json"]))
+    cov = report["coverage"]
+    first, last = report["classes"]
+    print(f"Prospect model fit on the {first}-{last} draft classes, drafted QB/RB/WR/TE, your league's scoring.")
+    print(
+        f"Coverage: {cov['drafted']} drafted, {cov['used']} used, {cov['no_college_link']} with no exact college "
+        f"link, {cov['no_birthdate']} with no birth date.\n"
+    )
+    print("Target: fantasy points per game scheduled over each player's first 3 NFL seasons.")
+    print("Scored by leaving one draft class out at a time and predicting it from the rest:\n")
+    labels = {
+        "post_draft": "Post-draft (draft capital + college + age + athleticism)",
+        "pre_draft": "Pre-draft (no draft capital)",
+        "baseline_draft_capital": "Baseline (draft capital + position only)",
+    }
+    for variant, v in report["variants"].items():
+        print(f"  {labels[variant]:<58} MAE {v['cv']['mae']:.2f} PPG, R^2 {v['cv']['r2']:.3f}, n={v['n']}")
+    print("\nWeights (applied to raw feature values, intercept first):")
+    for variant, v in report["variants"].items():
+        print(f"  {variant}: intercept {v['weights'][0]:+.3f}")
+        for name, w in zip(v["features"], v["weights"][1:]):
+            print(f"      {name:<16} {w:+.3f}")
 
 
 def _latest_ingested_season(conn) -> int | None:
@@ -622,6 +652,11 @@ def main() -> None:
         "--force", action="store_true", help="Re-download even if cached, needed for the in-progress college season."
     )
     college_parser.set_defaults(func=cmd_ingest_college)
+
+    sub.add_parser(
+        "fit-prospect-model",
+        help="[Phase 4] Fit the rookie prospect model against real 2018-2023 draft class outcomes and report its accuracy.",
+    ).set_defaults(func=cmd_fit_prospect_model)
 
     valuate_parser = sub.add_parser(
         "valuate",

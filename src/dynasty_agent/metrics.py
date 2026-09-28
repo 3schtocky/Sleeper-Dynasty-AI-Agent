@@ -339,3 +339,84 @@ def matchup_win_probability(mean_diff: float, std_diff: float) -> float:
             return 0.0
         return 0.5
     return normal_cdf(mean_diff / std_diff)
+
+
+# -- Phase 4: prospect metrics ---------------------------------------------------
+
+def age_on(birthdate: date | None, on: date) -> float | None:
+    """Exact age in years (decimal) on a given date. None without a birth
+    date: by explicit decision, age is never estimated from class year."""
+    if birthdate is None:
+        return None
+    return (on - birthdate).days / 365.25
+
+
+def dominator_rating(
+    rec_yds: float | None, rec_td: float | None, team_rec_yds: float | None, team_rec_td: float | None
+) -> float | None:
+    """Share of the team's receiving yards and receiving touchdowns, averaged,
+    0 to 1. None when either team total is zero or missing: the ratio is
+    undefined, and a silent 0 would read as a real, terrible season."""
+    if not team_rec_yds or not team_rec_td:
+        return None
+    return ((rec_yds or 0.0) / team_rec_yds + (rec_td or 0.0) / team_rec_td) / 2.0
+
+
+BREAKOUT_DOMINATOR = 0.20
+# College seasons start around Labor Day; a breakout season's age is taken
+# on September 1 of that season.
+SEASON_START_MONTH_DAY = (9, 1)
+
+
+def breakout_age(seasons: list[tuple[int, float | None]], birthdate: date | None) -> tuple[str, float | None]:
+    """Age at the start of the first college season with a dominator rating
+    at or above 20%. Returns (status, age):
+    ("broke_out", age), ("never", None) when no season reached 20%, or
+    ("unknown", None) when there is no birth date. "never" and "unknown"
+    are deliberately different: one is a real, bad signal, the other is
+    missing data, and a model must not read them the same way."""
+    broke = sorted(season for season, dom in seasons if dom is not None and dom >= BREAKOUT_DOMINATOR)
+    if not broke:
+        return "never", None
+    if birthdate is None:
+        return "unknown", None
+    month, day = SEASON_START_MONTH_DAY
+    return "broke_out", age_on(birthdate, date(broke[0], month, day))
+
+
+def speed_score(weight_lb: float | None, forty: float | None) -> float | None:
+    """Weight-adjusted 40 time (Bill Barnwell's speed score): weight * 200 /
+    forty^4. A 4.40 at 220 lb is a very different athlete from a 4.40 at 180."""
+    if not weight_lb or not forty:
+        return None
+    return weight_lb * 200.0 / forty**4
+
+
+# (test, higher_is_better) for athletic_score. The 40 enters as speed score.
+ATHLETIC_TESTS: tuple[tuple[str, bool], ...] = (
+    ("speed_score", True),
+    ("vertical", True),
+    ("broad_jump", True),
+    ("cone", False),
+    ("shuttle", False),
+    ("weight_lb", True),
+)
+MIN_ATHLETIC_TESTS = 3
+
+
+def athletic_score(player: dict, population: list[dict]) -> tuple[float | None, int]:
+    """This project's own position-relative athletic score, not the
+    external RAS: each test the player ran, percentile-ranked against the
+    same position's population (inverted where lower is better), averaged.
+    Returns (score 0-100, tests used). None below MIN_ATHLETIC_TESTS tests,
+    one or two drills say too little to summarize."""
+    percentiles = []
+    for test, higher_is_better in ATHLETIC_TESTS:
+        value = player.get(test)
+        if value is None:
+            continue
+        pct = percentile_rank(value, [p.get(test) for p in population])
+        percentiles.append(pct if higher_is_better else 100.0 - pct)
+    if len(percentiles) < MIN_ATHLETIC_TESTS:
+        return None, len(percentiles)
+    return sum(percentiles) / len(percentiles), len(percentiles)
