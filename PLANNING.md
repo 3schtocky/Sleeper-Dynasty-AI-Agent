@@ -140,6 +140,32 @@ A ranked prospect board for the next rookie draft, with a recommendation on any 
 
 **Phase 4 status: done**, pending the user's approval per the phase rule. Later, not scoped: the labeled mock-draft consensus sentiment layer.
 
+## Phase 5: talk to the agent (planned, not started)
+
+Goal: ask "should I trade Coleman and a 2028 2nd for a 2027 1st?" or "who do I start this week?" in plain English, answered by an open-source model running locally on the MacBook Air M4 (16GB), instead of typing `uv run` commands.
+
+### Decisions confirmed with the user
+- Runtime: Ollama, chosen as the easiest to understand and build with (`ollama pull qwen3:4b`; `ollama run` to try the bare model by hand; a plain local HTTP API the existing `httpx` reaches, no new Python dependency).
+- Interface: terminal chat first (`dynasty-agent chat`); a local web page can come later on the same core.
+
+### Core design: the model routes and explains, Python computes every number
+A ~4B model is fine at understanding a question and phrasing an answer, unreliable at arithmetic and recall. It never computes or remembers a stat: it picks a tool, the existing deterministic function runs, and it explains the returned numbers. That keeps this file's rules true in chat: every recommendation shows its inputs, no projection that can't trace to the database.
+
+Tools, thin wrappers over functions that already return dicts, flat arguments, a small set so a 4B model routes reliably: valuate / my roster, evaluate_trade, set_lineup (optimize_lineup), faab_bid and waiver_targets, predict_matchup, game_conditions (weather and schedule), prospect_board, picks, taxi. Player names stay resolved by `valuation.resolve_player`; an ambiguous name ("Justin Jefferson" matches a WR and an LB) comes back as a clarifying question, never a guess.
+
+### Build order
+1. [ ] Refactor: move printing out of `cli.py` into formatters, extract `digest` assembly into `weekly.py`, so the CLI and chat share one path returning plain dicts.
+2. [ ] `llm.py`: a minimal Ollama client (`POST /api/chat` with tools), model and URL from `.env`.
+3. [ ] `tools.py`: tool schemas and dispatch; every result carries its inputs and data basis.
+4. [ ] `dynasty-agent chat`: `refresh` first (the working rule), then a conversation loop; shows which tool ran, `/raw` prints the underlying numbers.
+5. [ ] Grounding check: every number in an answer must appear in that turn's tool output, else the raw output is shown instead; draft-model caveats carried through.
+6. [ ] Evaluation set: ~40 real questions with the expected tool and arguments, offline routing tests plus a live `chat-eval`; a bake-off of 2-3 ~4B models, picked by result.
+7. [ ] Docs: this file's "No GPU work and no local models" rule changes deliberately, with the reason recorded; Ollama install steps in README and WINDOWS.md.
+
+### Stated limits
+- Sleeper's API is read-only: the agent recommends a lineup, bid, trade, or taxi move; the user makes it in the Sleeper app.
+- A small model will sometimes misroute; the grounding check and eval set measure and contain that, not claim it never happens.
+
 ## Staying current in season
 
 Found by asking "will this stay up to date?": it didn't. Nothing ran on its own, the 2026 season's stats sat un-ingested three weeks in, and ingesting them would have switched every value from 17 games of 2025 to 3 noisy games of 2026 in one step.
