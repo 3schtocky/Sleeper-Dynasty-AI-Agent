@@ -22,10 +22,12 @@ It is built for **one specific league shape**: 12 teams, 1QB, full PPR, no TE pr
 - **`ingest-draft-data`** — real NFL draft picks and combine testing (nflverse) plus a player id crosswalk (DynastyProcess and nflverse) linking Sleeper, ESPN, and Pro Football Reference ids.
 - **`ingest-college`** — college production from sportsdataverse's free ESPN college football data, with each team's conference and opponent-adjusted strength.
 - **`fit-prospect-model`** — fits the rookie model against how the 2018 through latest-complete draft classes actually scored in your league's format, and reports its held-out accuracy.
-- **`prospect-board`** *(Phase 4, in progress)* — a ranked rookie board. `--mode post-draft` ranks by draft capital (college production was tested and adds nothing once draft capital is known); `--mode pre-draft` ranks on college production and team context before the draft order exists, a weak signal labeled weak on every run.
+- **`prospect-board`** — a ranked rookie board. `--mode post-draft` ranks by draft capital (college production was tested and adds nothing once draft capital is known); `--mode pre-draft` ranks on college production and team context before the draft order exists, a weak signal labeled weak on every run.
+- **`picks`** — your rookie picks for the next three drafts (`--all` for every team): the next draft's projected slot, what that slot's rookies have really produced since 2018, FantasyCalc's price, and buy, hold, or sell against what FantasyCalc now pays for the rookies that same slot bought last year.
+- **`taxi`** — which players to move to taxi or IR right now to free bench spots, and whether next year's rookie draft forces a cut, every rule read from your league's settings.
 - **`calibrate-blend`** — reruns the backtest behind how much last season counts this season (see below).
 
-Still to come in Phase 4: buy, hold, or sell guidance on the picks you hold, and taxi-squad planning. See `PLANNING.md`.
+Next: Phase 5, talking to the agent in plain English through a local open-source model instead of typing commands. See `PLANNING.md`.
 
 ## Requirements
 
