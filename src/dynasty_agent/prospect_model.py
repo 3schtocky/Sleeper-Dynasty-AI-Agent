@@ -520,3 +520,55 @@ def pre_draft_board(conn: sqlite3.Connection, draft_class: int, min_college_seas
     return {"mode": "pre_draft", "draft_class": draft_class, "models": {"pre_draft": with_age, "pre_draft_no_age": no_age},
             "last_college_season": last_season, "skipped_thin_sample": skipped_thin,
             "skipped_unrated_team": skipped_unrated, "rows": rows}
+
+
+# -- rookie values inside the existing valuation ---------------------------------------
+
+# A player counts as a rookie for valuation when he has fewer than this many
+# games in the valuation season and at most one year of NFL experience.
+# Below 4 games, a sample mean says little (see metrics.sample_mean_variance),
+# and without this every rookie was valued at exactly 0.
+ROOKIE_MAX_GAMES = 4
+ROOKIE_MAX_YEARS_EXP = 1
+
+
+def rookie_projections(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
+    """{sleeper_id: projection} for every QB/RB/WR/TE on an NFL team with at
+    most ROOKIE_MAX_YEARS_EXP years of experience and fewer than
+    ROOKIE_MAX_GAMES games in `season`, from the draft-capital model (the
+    one that held up out of sample). Empty when no model is fitted yet.
+
+    projected_ppg is points per game SCHEDULED over the first 3 NFL
+    seasons, the model's own target, so it runs a little conservative next
+    to a veteran's per-game-played average, and it's a 3-year average
+    applied to a single year. Both are stated wherever it's shown."""
+    model = load_model(conn, "baseline_draft_capital")
+    if model is None:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT p.player_id, p.position, d.pick
+        FROM players p
+        LEFT JOIN player_ids pi ON pi.sleeper_id = p.player_id
+        LEFT JOIN nfl_draft_picks d ON d.gsis_id = pi.gsis_id AND pi.gsis_id IS NOT NULL
+        WHERE p.position IN ('QB', 'RB', 'WR', 'TE') AND p.team IS NOT NULL
+          AND coalesce(p.years_exp, 0) <= ?
+          AND (SELECT count(*) FROM weekly_stats w WHERE w.player_id = p.player_id AND w.season = ?) < ?
+        """,
+        (ROOKIE_MAX_YEARS_EXP, str(season), ROOKIE_MAX_GAMES),
+    ).fetchall()
+    result: dict[str, dict] = {}
+    for r in rows:
+        if r["player_id"] in result:
+            continue  # a player can match two crosswalk rows; the first real pick wins
+        pick = r["pick"] or UNDRAFTED_PICK
+        features = {
+            "pos_RB": float(r["position"] == "RB"), "pos_WR": float(r["position"] == "WR"),
+            "pos_TE": float(r["position"] == "TE"), "log_pick": math.log(pick),
+        }
+        result[r["player_id"]] = {
+            "projected_ppg": _project(model, features),
+            "draft_pick": r["pick"],
+            "undrafted": r["pick"] is None,
+        }
+    return result

@@ -265,3 +265,57 @@ def test_find_successor_league_matches_on_previous_league_id(monkeypatch):
 def test_find_successor_league_is_none_before_renewal(monkeypatch):
     monkeypatch.setattr(sleeper, "list_leagues_for_season", lambda user_id, season: [])
     assert sleeper.find_successor_league("u1", "L1", "2026") is None
+
+
+# -- rookie values ------------------------------------------------------------------
+
+
+def add_baseline_model(conn, weights):
+    conn.execute(
+        "INSERT INTO prospect_model (variant, features_json, weights_json, n_rows, training_classes, ridge_lambda, fitted_at) "
+        "VALUES ('baseline_draft_capital', ?, ?, 400, '2018-2023', 1.0, 't')",
+        (json.dumps(["pos_RB", "pos_WR", "pos_TE", "log_pick"]), json.dumps(weights)),
+    )
+
+
+def add_rookie(conn, pid, position, pick, years_exp=0, games=0):
+    add_player(conn, pid, position, 10.0, games=games)
+    conn.execute("UPDATE players SET years_exp = ? WHERE player_id = ?", (years_exp, pid))
+    gsis = f"00-{pid}"
+    conn.execute("INSERT INTO player_ids (row_key, gsis_id, sleeper_id, fetched_at) VALUES (?, ?, ?, 't')", (gsis, gsis, pid))
+    if pick is not None:
+        conn.execute(
+            "INSERT INTO nfl_draft_picks (season, round, pick, gsis_id, position, fetched_at) VALUES (2026, 1, ?, ?, ?, 't')",
+            (pick, gsis, position),
+        )
+
+
+def test_rookies_are_valued_from_the_prospect_model_not_zero(conn):
+    import math
+    add_baseline_model(conn, [10.0, 1.0, 0.5, -0.5, -2.0])  # intercept, pos_RB, pos_WR, pos_TE, log_pick
+    add_rookie(conn, "rb1", "RB", pick=10)
+    add_rookie(conn, "udfa", "WR", pick=None)
+    v = valuation.player_valuations(conn, 2025)
+
+    assert v["rb1"]["value_source"] == "prospect_model"
+    assert v["rb1"]["fantasy_points_per_game"] == pytest.approx(10.0 + 1.0 - 2.0 * math.log(10))
+    assert v["rb1"]["draft_pick"] == 10 and v["rb1"]["games"] == 0
+    assert v["rb1"]["win_now_value"] > 0
+
+    assert v["udfa"]["undrafted"] is True
+    assert v["udfa"]["fantasy_points_per_game"] == pytest.approx(10.0 + 0.5 - 2.0 * math.log(260))
+
+
+def test_a_rookie_with_a_real_sample_keeps_his_real_stats(conn):
+    add_baseline_model(conn, [10.0, 1.0, 0.5, -0.5, -2.0])
+    add_rookie(conn, "rb2", "RB", pick=40, games=5)  # 5 real games at 10.0 PPG
+    add_rookie(conn, "vet", "WR", pick=41, years_exp=4, games=0)  # not a rookie: no projection, absent
+    v = valuation.player_valuations(conn, 2025)
+    assert v["rb2"]["value_source"] == "nfl_stats"
+    assert v["rb2"]["fantasy_points_per_game"] == 10.0
+    assert "vet" not in v
+
+
+def test_no_fitted_model_means_no_rookie_values_not_a_crash(conn):
+    add_rookie(conn, "rb3", "RB", pick=10)
+    assert "rb3" not in valuation.player_valuations(conn, 2025)

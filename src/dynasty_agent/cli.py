@@ -360,8 +360,11 @@ def cmd_valuate(args: argparse.Namespace) -> None:
         print(
             f"{label:<7} {name:<22} {pos:<4} {age:<4} "
             f"{v['fantasy_points_per_game']:>6.1f} {v['situation_score']:>6.1f} "
-            f"{v['win_now_value']:>8.1f} {v['three_year_value']:>8.1f}"
+            f"{v['win_now_value']:>8.1f} {v['three_year_value']:>8.1f}{_rookie_note(v)}"
         )
+
+    if any(valuations.get(r["player_id"], {}).get("value_source") == "prospect_model" for r in my_players):
+        print(_ROOKIE_FOOTNOTE)
 
     verdict = valuation.contend_or_rebuild(conn, season, roster["roster_id"])
     print()
@@ -374,6 +377,21 @@ def cmd_valuate(args: argparse.Namespace) -> None:
         f"({verdict['three_year_percentile']:.0f}th percentile of {len(verdict['league_three_year_totals'])} teams), "
         f"{verdict['games_played']} games played this season."
     )
+
+
+_ROOKIE_FOOTNOTE = (
+    "\n* Rookie: fewer than 4 NFL games, so FPPG is the prospect model's projection from real draft capital "
+    "(fit on 2018-2023 classes), not NFL production. It's points per game scheduled over a first 3 seasons, so it "
+    "runs a little conservative next to a veteran's per-game-played average. Run `prospect-board` for the inputs."
+)
+
+
+def _rookie_note(v: dict) -> str:
+    if v.get("value_source") != "prospect_model":
+        return ""
+    if v.get("undrafted"):
+        return "  * rookie, undrafted (priced as the last pick, outside the model's training data)"
+    return f"  * rookie, projected from pick {v['draft_pick']}"
 
 
 def _parse_pick(spec: str) -> tuple[int, int]:
@@ -424,7 +442,7 @@ def cmd_trade(args: argparse.Namespace) -> None:
         if not side["players"] and not side["picks"]:
             print("  (nothing)")
         for p in side["players"]:
-            note = "" if p["has_data"] else "  (no games this season, my-model valuation is 0)"
+            note = _rookie_note(p) if p["has_data"] else "  (no games this season, my-model valuation is 0)"
             market_str = f"{p['market_value']:.0f}" if p["market_value"] is not None else "-"
             print(
                 f"  {p['full_name']:<22} {p['position'] or '':<4} "
@@ -457,6 +475,8 @@ def cmd_trade(args: argparse.Namespace) -> None:
     print_side("You send", result["sent"])
     print()
     print_side("You receive", result["received"])
+    if any(p.get("value_source") == "prospect_model" for side in (result["sent"], result["received"]) for p in side["players"]):
+        print(_ROOKIE_FOOTNOTE)
     print()
     print(f"Net win-now (players only): {result['win_now_delta']:+.1f}")
     print(f"Net 3yr, mine (players only): {result['player_three_year_delta']:+.1f}")

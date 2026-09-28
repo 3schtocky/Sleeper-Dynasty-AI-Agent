@@ -22,6 +22,7 @@ import sqlite3
 import duckdb
 
 from dynasty_agent import market, nflverse
+from dynasty_agent.prospect_model import rookie_projections
 from dynasty_agent.metrics import (
     best_lineup_total,
     discounted_pick_value,
@@ -123,9 +124,11 @@ def team_situation_scores(season: int) -> dict[str, dict]:
 
 
 def player_valuations(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
-    """One valuation per player with both a players-table entry and at
-    least one weekly_stats row this season: production score, win-now
-    value, and three-year value, plus every input that fed them."""
+    """One valuation per player with a players-table entry and either real
+    weekly_stats rows this season or a prospect-model projection (a rookie,
+    see prospect_model.rookie_projections): production score, win-now
+    value, and three-year value, plus every input that fed them.
+    value_source says which: "nfl_stats" or "prospect_model"."""
 
     situations = team_situation_scores(season)
 
@@ -140,22 +143,49 @@ def player_valuations(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
         (str(season),),
     ).fetchall()
 
-    result: dict[str, dict] = {}
-    for row in rows:
+    def value_row(row, fppg: float, games: int, source: dict) -> dict:
         team_situation = situations.get(to_nflverse_team(row["team"]), {}).get("situation_score", 50.0)
-        prod = production_score(row["fppg"], row["position"])
-        result[row["player_id"]] = {
+        prod = production_score(fppg, row["position"])
+        return {
             "full_name": row["full_name"],
             "position": row["position"],
             "team": row["team"],
             "age": row["age"],
-            "fantasy_points_per_game": row["fppg"],
-            "games": row["games"],
+            "fantasy_points_per_game": fppg,
+            "games": games,
             "situation_score": team_situation,
             "production_score": prod,
             "win_now_value": win_now_value(prod, row["position"], row["age"], team_situation),
             "three_year_value": three_year_value(prod, row["position"], row["age"], team_situation),
+            **source,
         }
+
+    # Rookies and near-rookies with fewer than 4 games: the prospect model's
+    # draft-capital projection instead of a thin (or empty) sample. Before
+    # this, every rookie was valued at exactly 0, see PLANNING.md Phase 3.5.
+    rookies = rookie_projections(conn, season)
+
+    result: dict[str, dict] = {}
+    for row in rows:
+        if row["player_id"] in rookies:
+            continue
+        result[row["player_id"]] = value_row(row, row["fppg"], row["games"], {"value_source": "nfl_stats"})
+
+    if rookies:
+        placeholders = ",".join("?" * len(rookies))
+        rookie_rows = conn.execute(
+            f"SELECT player_id, full_name, position, team, age FROM players WHERE player_id IN ({placeholders})",
+            list(rookies),
+        ).fetchall()
+        for row in rookie_rows:
+            r = rookies[row["player_id"]]
+            games = conn.execute(
+                "SELECT count(*) FROM weekly_stats WHERE player_id = ? AND season = ?", (row["player_id"], str(season))
+            ).fetchone()[0]
+            result[row["player_id"]] = value_row(
+                row, r["projected_ppg"], games,
+                {"value_source": "prospect_model", "draft_pick": r["draft_pick"], "undrafted": r["undrafted"]},
+            )
     return result
 
 
@@ -320,6 +350,9 @@ def _value_trade_side(
                 "three_year_value": v["three_year_value"] if v else 0.0,
                 "market_value": market.latest_value(conn, p["player_id"]),
                 "has_data": v is not None,
+                "value_source": v.get("value_source") if v else None,
+                "draft_pick": v.get("draft_pick") if v else None,
+                "undrafted": v.get("undrafted") if v else None,
             }
         )
 
