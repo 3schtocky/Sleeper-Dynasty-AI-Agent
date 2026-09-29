@@ -18,7 +18,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
-from dynasty_agent import context, formatters, picks, taxi, valuation, weekly
+from dynasty_agent import context, explain, formatters, picks, taxi, valuation, weekly
 from dynasty_agent.valuation import AmbiguousPlayer, PlayerNotFound
 
 _LIST = {"type": "array", "items": {"type": "string"}}
@@ -59,6 +59,9 @@ TOOLS = [
     _tool("taxi_plan", "Which of the user's players to move to taxi or IR to free roster spots."),
 ]
 TOOL_NAMES = [t["function"]["name"] for t in TOOLS]
+# Not offered to the model: a seventh tool dropped its routing of the six from 39 of 39 to 36 on the
+# bake-off questions, so Python recognizes an explain question itself (explain.detect) and calls this.
+EXPLAIN = "explain"
 
 # What a win probability or projection here is, carried into every answer
 # that shows one: the matchup model is a heuristic never checked against
@@ -72,6 +75,8 @@ class ToolResult:
     numbers: str = ""
     compact: dict = field(default_factory=dict)
     clarification: str | None = None
+    data: object = None  # the full result the numbers were formatted from, kept so a follow-up can explain it
+    take: bool = True  # False when Python's text already answers, so the model adds nothing
 
 
 def _as_list(value) -> list[str]:
@@ -137,16 +142,20 @@ def _clarify(e: ValueError) -> str:
     return str(e)
 
 
-def run_tool(conn: sqlite3.Connection, name: str, args: dict | None) -> ToolResult:
+def run_tool(conn: sqlite3.Connection, name: str, args: dict | None, recent: list[ToolResult] | None = None) -> ToolResult:
     """Run one tool on the real league. Raises AgentError for setup
     problems (no sync, no stats); returns a clarification for a question
-    the user has to answer (which player, which pick)."""
+    the user has to answer (which player, which pick). recent is the last
+    few results in this chat, oldest first, which explain reads to find what
+    "that" refers to."""
     args = args or {}
-    if name not in TOOL_NAMES:
+    if name not in TOOL_NAMES and name != EXPLAIN:
         return ToolResult(name, clarification=f"I don't have a tool called {name}.")
     me = context.my_roster_id(conn)
     season = context.stats_season(conn)
     try:
+        if name == EXPLAIN:
+            return _explain(conn, season, args, recent or [])
         return _RUNNERS[name](conn, me, season, args)
     except (AmbiguousPlayer, PlayerNotFound) as e:
         return ToolResult(name, clarification=_clarify(e))
@@ -189,7 +198,7 @@ def _set_lineup(conn, me, season, args) -> ToolResult:
         "warnings": formatters.lineup_warnings(r) + ([note] if note else []),
         "caveat": DRAFT_CAVEAT,
     }
-    return ToolResult("set_lineup", formatters.format_lineup(r, season, vegas, note), compact)
+    return ToolResult("set_lineup", formatters.format_lineup(r, season, vegas, note), compact, data=r)
 
 
 def _evaluate_trade(conn, me, season, args) -> ToolResult:
@@ -228,7 +237,7 @@ def _evaluate_trade(conn, me, season, args) -> ToolResult:
         "warnings": r["warnings"],
         "units": "market values are FantasyCalc trade-value points, not dollars; win-now is points per game",
     }
-    return ToolResult("evaluate_trade", formatters.format_trade(r, season), compact)
+    return ToolResult("evaluate_trade", formatters.format_trade(r, season), compact, data=r)
 
 
 def fix_sides(conn, me: int, send: list[str], receive: list[str], send_picks: list[str],
@@ -288,7 +297,7 @@ def _my_team(conn, me, season, args) -> ToolResult:
         "games_played": v["games_played"],
         "most_valuable_now": [f"{p['full_name']} {p['position']} {p['valuation']['win_now_value']:.1f}" for p in top],
     }
-    return ToolResult("my_team", formatters.format_my_team(team), compact)
+    return ToolResult("my_team", formatters.format_my_team(team), compact, data=team)
 
 
 def _waiver_targets(conn, me, season, args) -> ToolResult:
@@ -304,7 +313,7 @@ def _waiver_targets(conn, me, season, args) -> ToolResult:
             "already_rostered": r["is_rostered"],
             "note": r["note"],
         }
-        return ToolResult("waiver_targets", formatters.format_faab(r), compact)
+        return ToolResult("waiver_targets", formatters.format_faab(r), compact, data=r)
     position = _blank_if_none(args.get("position")).upper() or None
     if position not in (None, "QB", "RB", "WR", "TE"):
         position = None
@@ -321,7 +330,7 @@ def _waiver_targets(conn, me, season, args) -> ToolResult:
         "remaining_budget": f"${targets[0]['remaining_budget']}" if targets else None,
         "note": targets[0]["note"] if targets else "nobody available has a win-now value this season",
     }
-    return ToolResult("waiver_targets", formatters.format_waiver_targets(targets), compact)
+    return ToolResult("waiver_targets", formatters.format_waiver_targets(targets), compact, data=targets)
 
 
 def _pick_advice(conn, me, season, args) -> ToolResult:
@@ -338,7 +347,8 @@ def _pick_advice(conn, me, season, args) -> ToolResult:
         ],
         "posture": verdict["verdict"],
     }
-    return ToolResult("pick_advice", formatters.format_picks(report, context.team_names(conn), me, verdict, False), compact)
+    return ToolResult("pick_advice", formatters.format_picks(report, context.team_names(conn), me, verdict, False), compact,
+                      data=report)
 
 
 def _taxi_plan(conn, me, season, args) -> ToolResult:
@@ -352,7 +362,70 @@ def _taxi_plan(conn, me, season, args) -> ToolResult:
             if r["overflow"] > 0 else "everyone fits next season, no cuts needed"
         ),
     }
-    return ToolResult("taxi_plan", formatters.format_taxi(r), compact)
+    return ToolResult("taxi_plan", formatters.format_taxi(r), compact, data=r)
+
+
+# -- explain -----------------------------------------------------------------------
+
+# Glossary terms whose full answer is a player's calculation when the user asks how.
+_VALUE_TERMS = {"win-now value", "three-year value", "situation score", "fppg"}
+_MAX_NAMES_LISTED = 6
+
+
+def _players_in(data, found: dict[str, str] | None = None) -> dict[str, str]:
+    """{player_id: name} for every player a result mentions, in order."""
+    found = {} if found is None else found
+    if isinstance(data, dict):
+        name = data.get("full_name") or data.get("player")
+        if data.get("player_id") and isinstance(name, str):
+            found.setdefault(data["player_id"], name)
+        for value in data.values():
+            _players_in(value, found)
+    elif isinstance(data, (list, tuple)):
+        for value in data:
+            _players_in(value, found)
+    return found
+
+
+def _glossary_result(definition: str) -> ToolResult:
+    return ToolResult("explain", numbers=definition, compact={"definition": definition}, take=False)
+
+
+def _explain(conn, season, args, recent: list[ToolResult]) -> ToolResult:
+    topic = _blank_if_none(args.get("topic"))
+    player = _blank_if_none(args.get("player")) or explain.find_player(conn, season, topic) or ""
+
+    def value_chain(player_id: str) -> ToolResult:
+        e = explain.explain_player_value(conn, season, player_id)
+        return ToolResult("explain", numbers=e.text(), compact=e.summary(), data=e.subject)
+
+    if player:
+        return value_chain(valuation.resolve_player(conn, _pin(conn, player))["player_id"])
+
+    hit = explain.lookup_glossary(topic)
+    wants_math = explain.wants_math(topic)
+    if hit and (hit[0] not in _VALUE_TERMS or not wants_math):
+        return _glossary_result(hit[1])
+
+    # A calculation with no player named: the player in the answer just shown, if there is one.
+    candidates: dict[str, str] = {}
+    for result in reversed(recent):
+        candidates = _players_in(result.data)
+        if candidates:
+            break
+    if len(candidates) == 1:
+        return value_chain(next(iter(candidates)))
+    if candidates:
+        names = list(candidates.values())
+        listed = ", ".join(names[:_MAX_NAMES_LISTED]) + (" or another player" if len(names) > _MAX_NAMES_LISTED else "")
+        return ToolResult("explain", clarification=f"Whose number should I walk through: {listed}?")
+    if hit:
+        return _glossary_result(hit[1])
+    return ToolResult(
+        "explain",
+        clarification="Which number should I explain? Name a player, for example: how did you get Trey Benson's "
+                      "win-now value? Or ask what a term means, like situation score or arbitrage.",
+    )
 
 
 _RUNNERS = {

@@ -244,6 +244,19 @@ After the preview (recorded, not built):
 - A one-line installer rewritten for Ollama (the old branch's LM Studio script has a `curl | bash` stdin bug, no `pipefail` and a PATH gap).
 - The first-run setup wizard, shaped by the user's clean-install test.
 
+### Conversation and explaining the math (branch `phase5-chat-explain`, 2026-09-29)
+The user tried the preview: it works but lacks conversation, and it can't say how it gets a number. A 4B model asked to explain methodology from memory would invent it, and the grounding check catches invented numbers, not invented reasoning. So Python writes the explanations and the model only retells them.
+
+Decisions confirmed with the user: step-by-step explanations with their own numbers; keep `qwen3:4b-instruct` and change its behavior (no fine-tuning); remember the last 3 answers. Built in phases with a stop after each: A player values and a glossary, B trades and lineup win probability, C FAAB bids, the verdict and pick advice.
+
+**Phase A (done).**
+- `explain.py`: `explain_player_value` builds the real chain (blended points per game, then position weight, age factor, situation factor, win-now, three-year) from the live constants in `metrics.py` and `blend.py`, never copies of them. Every chain is checked against `player_valuations` before it is returned; a mismatch raises `ExplanationMismatch` and nothing is shown. A glossary of 13 terms (win-now, 3yr, market value, situation score, FPPG, variance, win probability, arbitrage, discount rate, posture, age, taxi, FAAB) is written in Python, the age entry reading the live `AGE_CURVES`.
+- Output: Python prints the steps block, the model retells it in up to six sentences, and a fixed hint follows. A definition is Python's own text with no model take. The take may quote numbers from the last 3 answers, so "why?" can refer to them; an invented number is still dropped.
+- **A seventh tool did not work, and the numbers show it.** Offering `explain` to the model dropped its routing of the original 39 questions from 39/39 to 36/39 (an A/B run: 39/39 with the tool removed, 36/39 with it), and it still missed explain questions ("What is arbitrage?", a bare "Why?"). Three rewrites of the tool's description and the router prompt each left the same three original questions wrong. So the model never sees `explain`: `explain.detect` recognizes the question in Python (narrow on purpose: "How do I get Puka Nacua?", "What's a good FAAB bid for Justin Fields?" and all 39 bake-off questions are tested never to match) and `explain.find_player` reads the player's name out of the question. A phrasing it misses falls through to the six-tool router and gets an ordinary answer.
+- Memory: the router still sees each question alone (earlier answers made the model imitate them, and a line naming earlier tools let names leak into a new question in the A/B run). Python keeps the last 3 results for explanations, and the answer to "Whose number?" goes back to `explain`.
+- Found live: a 160-token cap cut a retelling mid-sentence (explain turns now get 420); "Why is his 3yr lower?" returned the definition instead of the player's chain (`wants_math` now counts why, where and explain); the model once wrote "x -1.03" (the prompt now forbids a minus the steps don't show).
+- Verified live on the real league: Trey Benson and Jonah Coleman chains, "why is his 3yr lower", "why does age matter for running backs", "what is arbitrage", and a trade followed by "why?".
+
 ### Stated limits
 - Sleeper's API is read-only: the agent recommends a lineup, bid, trade, or taxi move; the user makes it in the Sleeper app.
 - A small model will sometimes misroute; the grounding check and eval set measure and contain that, not claim it never happens.

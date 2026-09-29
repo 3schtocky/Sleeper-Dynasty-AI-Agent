@@ -33,6 +33,8 @@ KEEP_ALIVE = "30m"
 # Routing is a decision, not prose: temperature 0, the same answer every time.
 ROUTE_OPTIONS = {"num_ctx": 8192, "temperature": 0, "num_predict": 200}
 TAKE_OPTIONS = {"num_ctx": 8192, "temperature": 0.2, "num_predict": 160}
+# A walk through a calculation runs longer than a take; a cap of 160 cut one off mid-sentence in the first live test.
+EXPLAIN_OPTIONS = {"num_ctx": 8192, "temperature": 0.2, "num_predict": 420}
 # A reply that spent this long loading the model says "loading model..."
 # instead of reporting a misleadingly slow first-words time.
 LOAD_NOTICE_SECONDS = 1.0
@@ -157,13 +159,13 @@ class OllamaClient:
         ]
         return calls, message.get("content") or "", _stats(self.model, data, None, time.monotonic() - started)
 
-    def stream(self, messages: list[dict]) -> Iterator[str | Stats]:
+    def stream(self, messages: list[dict], options: dict | None = None) -> Iterator[str | Stats]:
         """Stream a reply with no tools: yields text pieces as they arrive,
         then one Stats (exact counts from Ollama's final chunk)."""
         started = time.monotonic()
         first_token_s = None
         body = {"model": self.model, "messages": messages, "stream": True, "think": False,
-                "options": TAKE_OPTIONS, "keep_alive": KEEP_ALIVE}
+                "options": options or TAKE_OPTIONS, "keep_alive": KEEP_ALIVE}
         try:
             with self._http.stream("POST", "/api/chat", json=body) as response:
                 if response.status_code == 404:
