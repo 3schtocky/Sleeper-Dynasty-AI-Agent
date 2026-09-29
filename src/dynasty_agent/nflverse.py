@@ -25,7 +25,7 @@ layer one.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -57,22 +57,53 @@ def _url(kind: str, season: int) -> str:
     return f"{RELEASE_BASE}/{tag}/{template.format(season=season)}"
 
 
+def download(url: str, dest: Path) -> Path:
+    """Stream url to dest atomically: write to a sibling .part file, then
+    rename over dest only once the whole body arrived. Writing straight to
+    dest (an earlier version did) left a truncated file behind on any
+    interrupted download, and every ensure_cached check after that treated
+    the corrupt file as a valid cache hit, forever."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    with httpx.stream("GET", url, timeout=60.0, follow_redirects=True) as response:
+        response.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                f.write(chunk)
+    tmp.replace(dest)
+    return dest
+
+
 def ensure_cached(kind: str, season: int, force: bool = False) -> Path:
     """Download a file to data/nflverse/ if it is not already there. Returns
     the local path. Raises httpx.HTTPStatusError (404) if the season is not
-    published yet, for example the current season before its first games."""
-    NFLVERSE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    published yet, for example the current season before its first games.
+
+    A cached file is never refreshed on its own: pass force=True to pick up
+    new weeks of an in-progress season (ingest_season does this for the
+    current NFL season, see there)."""
     dest = NFLVERSE_CACHE_DIR / f"{kind}_{season}.parquet"
     if dest.exists() and not force:
         return dest
+    return download(_url(kind, season), dest)
 
-    url = _url(kind, season)
-    with httpx.stream("GET", url, timeout=60.0, follow_redirects=True) as response:
-        response.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
-                f.write(chunk)
-    return dest
+
+# nflverse's schedules file: every game, venue, roof, and Vegas line, one
+# file for every season. Lines move all week in-season, so this cache has a
+# short max age instead of the season files' refresh-on-request rule. An
+# earlier version read it straight over HTTP on every call, several times
+# per player in `digest`, the main cost behind that command's runtime.
+GAMES_URL = f"{RELEASE_BASE}/schedules/games.parquet"
+GAMES_MAX_AGE = timedelta(hours=6)
+
+
+def ensure_games_cached(force: bool = False) -> Path:
+    dest = NFLVERSE_CACHE_DIR / "games.parquet"
+    if dest.exists() and not force:
+        modified = datetime.fromtimestamp(dest.stat().st_mtime, tz=timezone.utc)
+        if datetime.now(timezone.utc) - modified < GAMES_MAX_AGE:
+            return dest
+    return download(GAMES_URL, dest)
 
 
 def season_is_available(season: int) -> bool:
@@ -97,9 +128,16 @@ def derive_weekly_metrics(conn: sqlite3.Connection, season: int, scoring_setting
 
     query = """
         WITH crosswalk AS (
-            SELECT DISTINCT season, week, gsis_id, sleeper_id, pfr_id
+            -- Exactly one row per (season, week, gsis_id), by construction:
+            -- a SELECT DISTINCT here would return two rows for a player
+            -- listed once with a sleeper_id and once without, and the join
+            -- below would then write his week twice under two different
+            -- player_id keys. Checked live, 2025 has no such case; grouped
+            -- anyway so a future file can't introduce one silently.
+            SELECT season, week, gsis_id, max(sleeper_id) AS sleeper_id, max(pfr_id) AS pfr_id
             FROM read_parquet(?)
             WHERE gsis_id IS NOT NULL
+            GROUP BY season, week, gsis_id
         ),
         snaps AS (
             SELECT season, week, pfr_player_id, offense_snaps, offense_pct
@@ -199,6 +237,9 @@ def derive_weekly_metrics(conn: sqlite3.Connection, season: int, scoring_setting
                 yprr_est, wo,
                 record["red_zone_touches"], record["inside_five_touches"],
                 record["qb_rush_attempts_per_game"], record["team_pass_rate_over_expected"],
+                # is_estimated is 1 on every row, on purpose: yards_per_route_run
+                # is always the snaps-based estimate (see the module docstring),
+                # never a true routes-run figure. It marks that column, not the row.
                 fantasy_points, 1, fetched_at,
             )
         )
@@ -250,6 +291,14 @@ def derive_depth_chart_weekly(conn: sqlite3.Connection, season: int) -> int:
 
     con = duckdb.connect()
     try:
+        columns = {c[0] for c in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(depth_path)]).fetchall()}
+    finally:
+        con.close()
+    if "pos_abb" not in columns:
+        return _derive_week_numbered_depth_chart(conn, season, depth_path)
+
+    con = duckdb.connect()
+    try:
         week_start_rows = con.execute(
             "SELECT week, MIN(game_date) FROM read_parquet(?) GROUP BY week ORDER BY week",
             [str(pbp_path)],
@@ -295,12 +344,56 @@ def derive_depth_chart_weekly(conn: sqlite3.Connection, season: int) -> int:
     return len(upsert_rows)
 
 
-def ingest_season(conn: sqlite3.Connection, season: int, scoring_settings: dict) -> str:
+def _derive_week_numbered_depth_chart(conn: sqlite3.Connection, season: int, depth_path: Path) -> int:
+    """nflverse's depth chart format before 2025: already one chart per
+    week (club_code, week, depth_team), no snapshot dates to map. Found when
+    ingesting 2024 crashed on the 2025-format query: every season before
+    2025 uses this shape. snapshot_dt, a real date in the newer format,
+    holds a "<season>-week-NN" label here, there is no date to record."""
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            """
+            SELECT week, club_code, full_name, gsis_id, position, try_cast(depth_team AS INTEGER)
+            FROM read_parquet(?)
+            WHERE formation = 'Offense' AND game_type = 'REG' AND week IS NOT NULL
+              AND position IN ('QB', 'RB', 'WR', 'TE', 'FB') AND gsis_id IS NOT NULL
+            """,
+            [str(depth_path)],
+        ).fetchall()
+    finally:
+        con.close()
+    fetched_at = utcnow()
+    conn.executemany(
+        """
+        INSERT INTO depth_chart_weekly (season, week, team, gsis_id, player_name, pos_abb, pos_rank, snapshot_dt, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (season, week, team, pos_abb, gsis_id) DO UPDATE SET
+            pos_rank = excluded.pos_rank, player_name = excluded.player_name,
+            snapshot_dt = excluded.snapshot_dt, fetched_at = excluded.fetched_at
+        """,
+        [
+            (str(season), week, team, gsis_id, name, pos, rank, f"{season}-week-{week:02d}", fetched_at)
+            for week, team, name, gsis_id, pos, rank in rows
+        ],
+    )
+    conn.commit()
+    return len(rows)
+
+
+def ingest_season(conn: sqlite3.Connection, season: int, scoring_settings: dict, force: bool = False) -> str:
     """Cache this season's nflverse files and derive weekly_stats. Returns a
     human-readable summary. If the season is not published yet, the current
-    season before its first games, says so instead of raising."""
+    season before its first games, says so instead of raising.
+
+    force re-downloads every file this season uses before deriving anything.
+    Needed for an in-progress season: without it, the first download's weeks
+    were the only weeks ever ingested, however many times this re-ran."""
     if not season_is_available(season):
         return f"nflverse has not published {season} stats yet. Nothing ingested."
+    if force:
+        for kind in FILES:
+            ensure_cached(kind, season, force=True)
     row_count = derive_weekly_metrics(conn, season, scoring_settings)
     depth_chart_rows = derive_depth_chart_weekly(conn, season)
     return (

@@ -154,6 +154,58 @@ def three_year_value(production: float, position: str | None, age: float | None,
     return production * three_year_age_factor(position, age) * situation_multiplier(situation_score_0_100)
 
 
+# -- lineup slots ---------------------------------------------------------------
+
+NON_STARTING_SLOTS = ("BN", "TAXI", "IR")
+
+# Sleeper's flex slot types and which positions each one accepts, filled
+# narrowest first by best_lineup_total.
+FLEX_SLOT_ELIGIBILITY: dict[str, tuple[str, ...]] = {
+    "REC_FLEX": ("WR", "TE"),
+    "WRRB_FLEX": ("RB", "WR"),
+    "FLEX": ("RB", "WR", "TE"),
+    "SUPER_FLEX": ("QB", "RB", "WR", "TE"),
+}
+
+
+def starting_slot_counts(roster_positions: list[str]) -> dict[str, int]:
+    """How many of each real starting slot a league uses, bench/taxi/IR
+    excluded, read from the league's own roster_positions rather than
+    hardcoded, so this stays correct against a differently shaped league."""
+    counts: dict[str, int] = {}
+    for slot in roster_positions:
+        if slot in NON_STARTING_SLOTS:
+            continue
+        counts[slot] = counts.get(slot, 0) + 1
+    return counts
+
+
+def best_lineup_total(players: list[tuple[str | None, float]], slot_counts: dict[str, int]) -> float:
+    """Highest total value a roster can start, given (position, value) per
+    player and the league's starting slot counts. Dedicated slots take each
+    position's best players, then flex slots take the best of what's left,
+    narrowest eligibility first. Exact for this league's shape (one FLEX,
+    one SUPER_FLEX, or both), since each wider slot's eligible set contains
+    the narrower one's; a league with both REC_FLEX and WRRB_FLEX could in a
+    rare case do slightly better than this greedy fill. Unfillable slots
+    contribute 0, not an error: a thin roster really does start a hole."""
+    remaining = sorted(players, key=lambda p: -p[1])
+    total = 0.0
+    for slot, count in slot_counts.items():
+        if slot in FLEX_SLOT_ELIGIBILITY:
+            continue
+        taken = [p for p in remaining if p[0] == slot][:count]
+        total += sum(v for _, v in taken)
+        for p in taken:
+            remaining.remove(p)
+    for slot, eligible in FLEX_SLOT_ELIGIBILITY.items():
+        taken = [p for p in remaining if p[0] in eligible][: slot_counts.get(slot, 0)]
+        total += sum(v for _, v in taken)
+        for p in taken:
+            remaining.remove(p)
+    return total
+
+
 # -- Phase 2: depth chart snapshot to week mapping ---------------------------
 
 def discounted_pick_value(base_value: float, years_from_base: int, discount_rate: float) -> float:
@@ -287,3 +339,123 @@ def matchup_win_probability(mean_diff: float, std_diff: float) -> float:
             return 0.0
         return 0.5
     return normal_cdf(mean_diff / std_diff)
+
+
+# -- Phase 4: prospect metrics ---------------------------------------------------
+
+def age_on(birthdate: date | None, on: date) -> float | None:
+    """Exact age in years (decimal) on a given date. None without a birth
+    date: by explicit decision, age is never estimated from class year."""
+    if birthdate is None:
+        return None
+    return (on - birthdate).days / 365.25
+
+
+def dominator_rating(
+    rec_yds: float | None, rec_td: float | None, team_rec_yds: float | None, team_rec_td: float | None
+) -> float | None:
+    """Share of the team's receiving yards and receiving touchdowns, averaged,
+    0 to 1. None when either team total is zero or missing: the ratio is
+    undefined, and a silent 0 would read as a real, terrible season."""
+    if not team_rec_yds or not team_rec_td:
+        return None
+    return ((rec_yds or 0.0) / team_rec_yds + (rec_td or 0.0) / team_rec_td) / 2.0
+
+
+BREAKOUT_DOMINATOR = 0.20
+# College seasons start around Labor Day; a breakout season's age is taken
+# on September 1 of that season.
+SEASON_START_MONTH_DAY = (9, 1)
+
+
+def breakout_age(seasons: list[tuple[int, float | None]], birthdate: date | None) -> tuple[str, float | None]:
+    """Age at the start of the first college season with a dominator rating
+    at or above 20%. Returns (status, age):
+    ("broke_out", age), ("never", None) when no season reached 20%, or
+    ("unknown", None) when there is no birth date. "never" and "unknown"
+    are deliberately different: one is a real, bad signal, the other is
+    missing data, and a model must not read them the same way."""
+    broke = sorted(season for season, dom in seasons if dom is not None and dom >= BREAKOUT_DOMINATOR)
+    if not broke:
+        return "never", None
+    if birthdate is None:
+        return "unknown", None
+    month, day = SEASON_START_MONTH_DAY
+    return "broke_out", age_on(birthdate, date(broke[0], month, day))
+
+
+def speed_score(weight_lb: float | None, forty: float | None) -> float | None:
+    """Weight-adjusted 40 time (Bill Barnwell's speed score): weight * 200 /
+    forty^4. A 4.40 at 220 lb is a very different athlete from a 4.40 at 180."""
+    if not weight_lb or not forty:
+        return None
+    return weight_lb * 200.0 / forty**4
+
+
+# (test, higher_is_better) for athletic_score. The 40 enters as speed score.
+ATHLETIC_TESTS: tuple[tuple[str, bool], ...] = (
+    ("speed_score", True),
+    ("vertical", True),
+    ("broad_jump", True),
+    ("cone", False),
+    ("shuttle", False),
+    ("weight_lb", True),
+)
+MIN_ATHLETIC_TESTS = 3
+
+
+def athletic_score(player: dict, population: list[dict]) -> tuple[float | None, int]:
+    """This project's own position-relative athletic score, not the
+    external RAS: each test the player ran, percentile-ranked against the
+    same position's population (inverted where lower is better), averaged.
+    Returns (score 0-100, tests used). None below MIN_ATHLETIC_TESTS tests,
+    one or two drills say too little to summarize."""
+    percentiles = []
+    for test, higher_is_better in ATHLETIC_TESTS:
+        value = player.get(test)
+        if value is None:
+            continue
+        pct = percentile_rank(value, [p.get(test) for p in population])
+        percentiles.append(pct if higher_is_better else 100.0 - pct)
+    if len(percentiles) < MIN_ATHLETIC_TESTS:
+        return None, len(percentiles)
+    return sum(percentiles) / len(percentiles), len(percentiles)
+
+
+# -- blending last season into this one ---------------------------------------------
+
+
+def blended_mean(prior_mean: float | None, prior_weight_games: float, current_values: list[float]) -> float | None:
+    """A season-to-date average that starts at the prior (last season's
+    average, or a rookie's projection) and moves toward this season's real
+    games as they accumulate. The prior counts as prior_weight_games games:
+    (K * prior + sum(current)) / (K + n). With no prior, just this season's
+    mean; with neither, None. This replaces a hard switch from one season to
+    the next, which valued a veteran on 3 noisy weeks the moment a new
+    season was ingested."""
+    n = len(current_values)
+    if prior_mean is None:
+        return sum(current_values) / n if n else None
+    if prior_weight_games + n == 0:
+        return prior_mean  # a zero-weight prior and no games yet: the prior is still all there is
+    return (prior_weight_games * prior_mean + sum(current_values)) / (prior_weight_games + n)
+
+
+def blended_variance(prior_values: list[float], prior_weight_games: float, current_values: list[float]) -> float | None:
+    """Week-to-week variance over last season's games and this season's,
+    last season's games sharing prior_weight_games of total weight, this
+    season's games weight 1 each: the same weighting blended_mean uses.
+    Reliability-weighted and bias-corrected (sum w (x - mean)^2 / (V1 -
+    V2 / V1)), which reduces to the ordinary n - 1 sample variance when
+    every weight is 1. None when there's too little weight to estimate one."""
+    weighted: list[tuple[float, float]] = []
+    if prior_values:
+        w = prior_weight_games / len(prior_values)
+        weighted += [(x, w) for x in prior_values]
+    weighted += [(x, 1.0) for x in current_values]
+    v1 = sum(w for _, w in weighted)
+    v2 = sum(w * w for _, w in weighted)
+    if not weighted or v1 - v2 / v1 <= 0:
+        return None
+    mean = sum(w * x for x, w in weighted) / v1
+    return sum(w * (x - mean) ** 2 for x, w in weighted) / (v1 - v2 / v1)

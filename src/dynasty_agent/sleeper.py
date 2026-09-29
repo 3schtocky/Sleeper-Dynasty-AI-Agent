@@ -59,6 +59,19 @@ def list_leagues_for_season(user_id: str, season: str) -> list[dict]:
     return response.json()
 
 
+def find_successor_league(user_id: str, league_id: str, league_season: str) -> dict | None:
+    """The renewed copy of league_id for the following season, if Sleeper
+    has created it yet. Sleeper gives a renewed dynasty league a brand-new
+    league_id each season, linked back only by previous_league_id, so a
+    .env written for last season keeps syncing last season's league
+    forever unless something checks. None if no renewal exists yet."""
+    next_season = str(int(league_season) + 1)
+    for league in list_leagues_for_season(user_id, next_season):
+        if league.get("previous_league_id") == league_id:
+            return league
+    return None
+
+
 class RateLimiter:
     """Keeps calls under a per-minute ceiling with a sliding window. At our
     actual call volumes this almost never sleeps; it exists as a floor, not
@@ -145,6 +158,9 @@ class SleeperClient:
 
     def get_traded_picks(self) -> list[dict]:
         return self._get(f"/league/{self.league_id}/traded_picks", ttl_seconds=3600)
+
+    def get_drafts(self) -> list[dict]:
+        return self._get(f"/league/{self.league_id}/drafts", ttl_seconds=3600)
 
     def get_draft(self, draft_id: str) -> dict:
         return self._get(f"/draft/{draft_id}", ttl_seconds=3600)
@@ -390,6 +406,49 @@ class SleeperClient:
         self.conn.commit()
         return matchups
 
+    def sync_drafts(self) -> list[dict]:
+        """Every draft this league has (the startup, then one rookie draft a
+        season), and every pick made in each. slot_to_roster_id is what maps
+        a draft slot to a real roster once the order is set. Phase 1 defined
+        both tables but nothing ever populated them."""
+        drafts = self.get_drafts()
+        fetched_at = utcnow()
+        self.conn.executemany(
+            """
+            INSERT INTO drafts (draft_id, league_id, season, status, type, settings_json, slot_to_roster_id_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (draft_id) DO UPDATE SET
+                league_id = excluded.league_id, season = excluded.season, status = excluded.status,
+                type = excluded.type, settings_json = excluded.settings_json,
+                slot_to_roster_id_json = excluded.slot_to_roster_id_json, fetched_at = excluded.fetched_at
+            """,
+            [
+                (
+                    d["draft_id"], self.league_id, d.get("season"), d.get("status"), d.get("type"),
+                    json.dumps(d.get("settings") or {}), json.dumps(d.get("slot_to_roster_id") or {}), fetched_at,
+                )
+                for d in drafts
+            ],
+        )
+        for d in drafts:
+            picks = self.get_draft_picks(d["draft_id"])
+            self.conn.execute("DELETE FROM draft_picks WHERE draft_id = ?", (d["draft_id"],))
+            self.conn.executemany(
+                """
+                INSERT INTO draft_picks (draft_id, pick_no, round, roster_id, player_id, is_keeper, metadata_json, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        d["draft_id"], p["pick_no"], p.get("round"), p.get("roster_id"), p.get("player_id"),
+                        1 if p.get("is_keeper") else 0, json.dumps(p.get("metadata") or {}), fetched_at,
+                    )
+                    for p in picks
+                ],
+            )
+        self.conn.commit()
+        return drafts
+
     def sync_nfl_state(self) -> dict:
         state = self.get_nfl_state()
         fetched_at = utcnow()
@@ -401,11 +460,12 @@ class SleeperClient:
         return state
 
     def sync_all(self) -> None:
-        """Refresh everything Phase 1's acceptance test needs: players,
-        league, users, rosters, traded picks, and nfl state."""
+        """Refresh players, league, users, rosters, traded picks, drafts,
+        and nfl state."""
         self.refresh_players()
         self.sync_league()
         self.sync_users()
         self.sync_rosters()
         self.sync_traded_picks()
+        self.sync_drafts()
         self.sync_nfl_state()

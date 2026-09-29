@@ -75,11 +75,20 @@ then open `.env` in Notepad (or any editor) and fill in the four values. Your le
 ## 5. Run it
 
 ```powershell
-uv run dynasty-agent sync                          # your league, rosters, and market values
+uv run dynasty-agent refresh                        # everything current: league, values, this season's stats
 uv run dynasty-agent roster                         # sanity check: is this your team?
-uv run dynasty-agent ingest-nflverse --season 2025  # the most recently completed NFL season
 uv run dynasty-agent valuate                        # win-now/three-year value + the verdict
 ```
+
+First run on a new machine: `sync`, `ingest-nflverse --season <last completed season>`, `ingest-draft-data`, `ingest-college --season 2008 --through <current season>`, then `fit-prospect-model`; see the main README.
+
+**Daily refresh.** `dynasty-agent schedule` uses macOS's launchd and tells you so on Windows. The Windows equivalent is one Task Scheduler command, run once from the project folder (written from Microsoft's documented `schtasks` syntax, not yet run on a Windows machine for this project):
+
+```powershell
+schtasks /Create /SC DAILY /ST 06:00 /TN "dynasty-agent refresh" /TR "cmd /c cd /d $PWD && uv run dynasty-agent refresh >> data\logs\refresh.log 2>&1"
+```
+
+Remove it with `schtasks /Delete /TN "dynasty-agent refresh" /F`.
 
 Evaluate a trade. PowerShell line continuation is a backtick (`` ` ``) at the very end of the line, not the backslash (`\`) you'd use in Bash, and it has to be the *last* character on the line, no trailing space after it or PowerShell won't recognize it:
 
@@ -126,7 +135,7 @@ New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
 
 then restart.
 
-**`ingest-nflverse` or `predict-matchup` fails to reach `github.com` or hangs on the first DuckDB query.** DuckDB installs a small extension (`httpfs`) the first time it needs to read a remote file, and on a locked-down corporate network or VPN that blocks outbound connections to unfamiliar hosts, that download (or the actual nflverse data fetch) can get blocked. Check whether a proxy or firewall is intercepting `github.com` and `objects.githubusercontent.com`; this isn't a Windows-specific issue, it'd behave the same way on any OS behind the same network policy.
+**`ingest-nflverse` or `predict-matchup` fails to reach `github.com` or hangs on the first DuckDB query.** Every nflverse file, the schedules file included, downloads through `httpx` into `data/nflverse/` before DuckDB reads it locally, and on a locked-down corporate network or VPN that blocks outbound connections to unfamiliar hosts, that download can get blocked. Check whether a proxy or firewall is intercepting `github.com` and `objects.githubusercontent.com`; this isn't a Windows-specific issue, it'd behave the same way on any OS behind the same network policy.
 
 **Everything works but output looks like `Ã¢â‚¬â€` instead of normal punctuation.** That's a console codepage issue, an old `cmd.exe` window not set to UTF-8. Switch to PowerShell (this guide assumes PowerShell throughout, not `cmd.exe`) or, if you must use `cmd.exe`, run `chcp 65001` first to switch its codepage to UTF-8.
 

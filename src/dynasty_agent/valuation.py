@@ -16,25 +16,29 @@ mean something. That is stated in every result, not left implicit.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import duckdb
+import httpx
 
-from dynasty_agent import market, nflverse
+from dynasty_agent import blend, market, nflverse
+from dynasty_agent.prospect_model import rookie_projections
 from dynasty_agent.metrics import (
+    best_lineup_total,
     discounted_pick_value,
     percentile_rank,
     production_score,
+    starting_slot_counts,
     three_year_value,
     win_now_value,
 )
 
-# This league's next rookie draft, the currency future picks trade in. The
-# inaugural rookie class (2026 NFL draft) is already rostered, confirmed in
-# Phase 0, so the picks that actually get traded from here on are 2027 and
-# later. FantasyCalc's own "2027 1st/2nd/3rd" unslotted values anchor the
-# discount model below, no draft order is known yet for an unplayed season.
-PICK_VALUE_BASE_SEASON = 2027
+# The discount model below anchors on the nearest rookie draft FantasyCalc
+# still prices (market.priced_pick_seasons), read live on every call. An
+# earlier version hardcoded 2027 here, correct only until the 2027 rookie
+# draft: FantasyCalc then stops listing "2027 1st", and every pick's model
+# value would have silently gone to None.
 
 # nflverse's own team codes occasionally differ from Sleeper's. Confirmed by
 # diffing the two team-code sets directly rather than assuming: only the
@@ -55,6 +59,10 @@ def team_situation_scores(season: int) -> dict[str, dict]:
     is better (an offensive line pass-protection proxy; true OL grades are
     paywalled, this is the public stand-in). Each is percentile ranked
     against all 32 NFL teams, then averaged into one 0-100 situation_score.
+
+    Regular season only, all three inputs. The play-by-play inputs used to
+    include playoff games, so the 14 playoff teams' rates carried extra,
+    unusually hard games the other 18 teams' didn't.
     """
 
     stats_path = nflverse.ensure_cached("stats_player_week", season)
@@ -75,7 +83,16 @@ def team_situation_scores(season: int) -> dict[str, dict]:
             """
             SELECT posteam AS team, avg(pass_oe) AS pass_rate_oe
             FROM read_parquet(?)
-            WHERE pass_oe IS NOT NULL AND posteam IS NOT NULL
+            WHERE season_type = 'REG' AND pass_oe IS NOT NULL AND posteam IS NOT NULL
+            GROUP BY posteam
+            """,
+            [str(pbp_path)],
+        ).fetchall()
+        games_rows = con.execute(
+            """
+            SELECT posteam AS team, count(DISTINCT game_id) AS games
+            FROM read_parquet(?)
+            WHERE season_type = 'REG' AND posteam IS NOT NULL
             GROUP BY posteam
             """,
             [str(pbp_path)],
@@ -85,7 +102,7 @@ def team_situation_scores(season: int) -> dict[str, dict]:
             SELECT posteam AS team,
                    sum(sack) * 1.0 / nullif(sum(pass_attempt) + sum(sack), 0) AS sack_rate
             FROM read_parquet(?)
-            WHERE posteam IS NOT NULL
+            WHERE season_type = 'REG' AND posteam IS NOT NULL
             GROUP BY posteam
             """,
             [str(pbp_path)],
@@ -93,6 +110,7 @@ def team_situation_scores(season: int) -> dict[str, dict]:
     finally:
         con.close()
 
+    team_games = dict(games_rows)
     qb_epa = dict(qb_rows)
     pass_rate = dict(pass_rate_rows)
     ol_pass_pro = {team: (1 - rate) if rate is not None else None for team, rate in sack_rows}
@@ -112,68 +130,121 @@ def team_situation_scores(season: int) -> dict[str, dict]:
             "pass_rate_percentile": pass_pct,
             "ol_pass_pro_percentile": ol_pct,
             "situation_score": (qb_pct + pass_pct + ol_pct) / 3.0,
+            "games": team_games.get(team, 0),
         }
     return result
 
 
 def player_valuations(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
-    """One valuation per player with both a players-table entry and at
-    least one weekly_stats row this season: production score, win-now
-    value, and three-year value, plus every input that fed them."""
+    """One valuation per player with a players-table entry and either real
+    weekly_stats rows this season or last, or a prospect-model projection
+    (a rookie, see prospect_model.rookie_projections): production score,
+    win-now value, and three-year value, plus every input that fed them.
 
-    situations = team_situation_scores(season)
+    Per-game production is blended (blend.player_distribution): last
+    season's average counts as a few games (blend.VETERAN_PRIOR_GAMES,
+    chosen by backtest) and this season's real games add on top, so a new
+    season takes over as it accumulates instead of all at once. A rookie's
+    prior is his projection. value_source says which prior: "nfl_stats" or
+    "prospect_model"."""
 
-    rows = conn.execute(
-        """
-        SELECT p.player_id, p.full_name, p.position, p.team, p.age,
-               avg(ws.fantasy_points) AS fppg, count(*) AS games
-        FROM players p
-        JOIN weekly_stats ws ON ws.player_id = p.player_id AND ws.season = ?
-        GROUP BY p.player_id
-        """,
-        (str(season),),
-    ).fetchall()
+    situations = blended_team_situations(season)
+
+    candidate_ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT ws.player_id FROM weekly_stats ws JOIN players p ON p.player_id = ws.player_id "
+            "WHERE ws.season IN (?, ?)",
+            (str(season), str(season - 1)),
+        )
+    ]
+    rookies = rookie_projections(conn, season)
+    ids = sorted(set(candidate_ids) | set(rookies))
+    rows = []
+    for chunk_start in range(0, len(ids), 900):
+        chunk = ids[chunk_start:chunk_start + 900]
+        rows += conn.execute(
+            f"SELECT player_id, full_name, position, team, age FROM players WHERE player_id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        ).fetchall()
 
     result: dict[str, dict] = {}
     for row in rows:
+        rookie = rookies.get(row["player_id"])
+        dist = blend.player_distribution(conn, row["player_id"], season, rookie=rookie)
+        if dist["mean"] is None:
+            continue
         team_situation = situations.get(to_nflverse_team(row["team"]), {}).get("situation_score", 50.0)
-        prod = production_score(row["fppg"], row["position"])
+        prod = production_score(dist["mean"], row["position"])
         result[row["player_id"]] = {
             "full_name": row["full_name"],
             "position": row["position"],
             "team": row["team"],
             "age": row["age"],
-            "fantasy_points_per_game": row["fppg"],
-            "games": row["games"],
+            "fantasy_points_per_game": dist["mean"],
+            "games": dist["current_games"],
+            "prior_games": dist["prior_games"],
+            "prior_weight": dist["prior_weight"],
             "situation_score": team_situation,
             "production_score": prod,
             "win_now_value": win_now_value(prod, row["position"], row["age"], team_situation),
             "three_year_value": three_year_value(prod, row["position"], row["age"], team_situation),
+            "value_source": dist["source"],
+            **({"draft_pick": rookie["draft_pick"], "undrafted": rookie["undrafted"]} if rookie else {}),
         }
     return result
+
+
+def blended_team_situations(season: int) -> dict[str, dict]:
+    """team_situation_scores for this season and last, blended by games
+    played (blend.blended_situations). A season nflverse hasn't published
+    yet simply contributes nothing."""
+
+    def scores(s: int) -> dict[str, dict]:
+        try:
+            return team_situation_scores(s)
+        except httpx.HTTPStatusError:
+            return {}
+
+    return blend.blended_situations(scores(season), scores(season - 1))
 
 
 def contend_or_rebuild(conn: sqlite3.Connection, season: int, my_roster_id: int) -> dict:
     """A verdict built from roster construction and compared against the
     other eleven teams, not from record or points, those are only a real
     signal once games have been played. Confidence is stated explicitly and
-    stays low until real in-season results accumulate."""
+    stays low until real in-season results accumulate.
+
+    Each team is scored on the best lineup it could start (starters and
+    bench, per the league's own roster_positions), win-now and three-year
+    each maximized separately. An earlier version summed whatever lineup
+    each manager last set in Sleeper, empty or stale all offseason and
+    wrong for any manager who hadn't set one, so the verdict measured
+    lineup-setting diligence as much as roster strength."""
 
     valuations = player_valuations(conn, season)
 
-    starters = conn.execute("SELECT roster_id, player_id FROM roster_players WHERE slot = 'starter'").fetchall()
+    league_row = conn.execute("SELECT roster_positions_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    if league_row is None:
+        raise ValueError("No league data cached yet. Run `dynasty-agent sync` first.")
+    slot_counts = starting_slot_counts(json.loads(league_row["roster_positions_json"]))
 
-    team_win_now: dict[int, list[float]] = {}
-    team_three_year: dict[int, list[float]] = {}
-    for r in starters:
+    eligible = conn.execute(
+        "SELECT roster_id, player_id FROM roster_players WHERE slot IN ('starter', 'bench')"
+    ).fetchall()
+    team_win_now: dict[int, list[tuple[str | None, float]]] = {}
+    team_three_year: dict[int, list[tuple[str | None, float]]] = {}
+    for r in eligible:
+        team_win_now.setdefault(r["roster_id"], [])
+        team_three_year.setdefault(r["roster_id"], [])
         v = valuations.get(r["player_id"])
         if v is None:
             continue
-        team_win_now.setdefault(r["roster_id"], []).append(v["win_now_value"])
-        team_three_year.setdefault(r["roster_id"], []).append(v["three_year_value"])
+        team_win_now[r["roster_id"]].append((v["position"], v["win_now_value"]))
+        team_three_year[r["roster_id"]].append((v["position"], v["three_year_value"]))
 
-    win_now_totals = {rid: sum(vals) for rid, vals in team_win_now.items()}
-    three_year_totals = {rid: sum(vals) for rid, vals in team_three_year.items()}
+    win_now_totals = {rid: best_lineup_total(vals, slot_counts) for rid, vals in team_win_now.items()}
+    three_year_totals = {rid: best_lineup_total(vals, slot_counts) for rid, vals in team_three_year.items()}
 
     my_win_now = win_now_totals.get(my_roster_id, 0.0)
     my_three_year = three_year_totals.get(my_roster_id, 0.0)
@@ -243,26 +314,29 @@ def resolve_player(conn: sqlite3.Connection, name_or_id: str) -> dict:
 
 def pick_value_estimate(conn: sqlite3.Connection, season: int, round_num: int, discount_rate: float) -> dict:
     """My model's value for a future pick: FantasyCalc's real, current
-    "{PICK_VALUE_BASE_SEASON} {round}" market price, discounted forward by
-    discount_rate per year of distance from that base season. Compared
-    against FantasyCalc's own price for this exact pick when they have one,
-    that comparison is the arbitrage; picks further out than FantasyCalc
-    prices get a model value but no arbitrage figure, there is nothing to
-    compare against."""
-    base_value = market.pick_market_value(conn, PICK_VALUE_BASE_SEASON, round_num)
+    market price for the nearest season it prices in this round (the base
+    season), discounted forward by discount_rate per year of distance from
+    that base season. Compared against FantasyCalc's own price for this
+    exact pick when they have one, that comparison is the arbitrage; picks
+    further out than FantasyCalc prices get a model value but no arbitrage
+    figure, there is nothing to compare against. A pick for a season before
+    the base season (a draft that already happened) gets no model value:
+    that pick no longer exists to trade."""
+    priced = market.priced_pick_seasons(conn, round_num)
+    base_season = priced[0] if priced else None
     this_pick_market_value = market.pick_market_value(conn, season, round_num)
 
-    if base_value is None:
+    if base_season is None or season < base_season:
         return {
-            "season": season, "round": round_num, "model_value": None,
+            "season": season, "round": round_num, "base_season": base_season, "model_value": None,
             "market_value": this_pick_market_value, "arbitrage": None,
         }
 
-    years_out = season - PICK_VALUE_BASE_SEASON
-    model_value = discounted_pick_value(base_value, years_out, discount_rate)
+    base_value = market.pick_market_value(conn, base_season, round_num)
+    model_value = discounted_pick_value(base_value, season - base_season, discount_rate)
     arbitrage = (model_value - this_pick_market_value) if this_pick_market_value is not None else None
     return {
-        "season": season, "round": round_num, "model_value": model_value,
+        "season": season, "round": round_num, "base_season": base_season, "model_value": model_value,
         "market_value": this_pick_market_value, "arbitrage": arbitrage,
     }
 
@@ -296,6 +370,9 @@ def _value_trade_side(
                 "three_year_value": v["three_year_value"] if v else 0.0,
                 "market_value": market.latest_value(conn, p["player_id"]),
                 "has_data": v is not None,
+                "value_source": v.get("value_source") if v else None,
+                "draft_pick": v.get("draft_pick") if v else None,
+                "undrafted": v.get("undrafted") if v else None,
             }
         )
 
@@ -309,12 +386,18 @@ def _value_trade_side(
     market_value_total = sum((r["market_value"] or 0.0) for r in player_rows) + sum(
         (r["model_value"] or 0.0) for r in pick_rows
     )  # comparable across players and picks, the one headline total
+    # Anything with no price counts 0 in market_value_total above; named
+    # here so the caller can say so instead of presenting a silent 0.
+    unpriced = [r["full_name"] for r in player_rows if r["market_value"] is None] + [
+        r["label"] for r in pick_rows if r["model_value"] is None
+    ]
     return {
         "players": player_rows,
         "picks": pick_rows,
         "win_now_total": win_now_total,
         "player_three_year_total": player_three_year_total,
         "market_value_total": market_value_total,
+        "unpriced": unpriced,
         "asset_count": len(player_rows) + len(pick_rows),
     }
 

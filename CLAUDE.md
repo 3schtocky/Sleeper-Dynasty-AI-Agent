@@ -4,13 +4,13 @@ A dynasty fantasy football agent for a single Sleeper league. It evaluates trade
 
 ## Status
 
-Phases 0 through 3 are built and verified against live data. Phase 4 (rookie draft prep) is in progress: the nflverse draft-capital/combine data layer is built and live-verified, but the actual prospect board is not built yet. College production (dominator rating, breakout age) has no confirmed data source: the College Football Data API was considered and rejected by request, it requires an email to register; no keyless, free, structured alternative has been confirmed yet, that's a real open question, see `PLANNING.md`. `PLANNING.md` is the build log, every methodology decision, real bug found and fixed, and live-verification result lives there; this file stays the reference doc, read `PLANNING.md` for the "why" behind a specific number.
+Phases 0 through 4 are built and verified against live data, including a full audit (Phase 3.5 in `PLANNING.md`) and in-season freshness (season blending, `refresh`, a daily `schedule`). Phase 4's key finding: once draft capital is known, college production adds nothing to a rookie projection, so the post-draft board ranks on draft capital; pre-draft ranks on college production and team context, labeled weak. Next is Phase 5: a local open-source model the user talks to, routing to these commands' functions (plan in `PLANNING.md`). `PLANNING.md` is the build log, every methodology decision, real bug found and fixed, and live-verification result lives there; this file stays the reference doc.
 
-Commands that exist today: `init`, `sync`, `roster`, `ingest-nflverse`, `ingest-draft-data` (Phase 4 data layer only), `valuate`, `trade`, `predict-matchup` (draft, not calibrated, see its own status note in `PLANNING.md`), `optimize-lineup`, `faab`, `digest`. `README.md` has usage for each; `WINDOWS.md` has the PowerShell equivalents.
+Commands that exist today: `init`, `sync`, `refresh` (everything current, by calendar), `schedule` (daily `refresh` via macOS launchd), `roster`, `ingest-nflverse`, `ingest-draft-data`, `ingest-college`, `fit-prospect-model`, `prospect-board`, `picks`, `taxi`, `calibrate-blend`, `valuate`, `trade`, `predict-matchup` (draft, not calibrated, see its own status note in `PLANNING.md`), `optimize-lineup`, `faab`, `digest`. `README.md` has usage for each; `WINDOWS.md` has the PowerShell equivalents.
 
 ## Environment
 
-- Developed on a MacBook Air M4, 16GB RAM, macOS. The tool itself is not macOS-only: audited directly for OS-specific assumptions (no subprocess calls, no hardcoded POSIX paths, `pathlib.Path` throughout) and runs identically on Windows, see `WINDOWS.md`.
+- Developed on a MacBook Air M4, 16GB RAM, macOS. The tool itself is not macOS-only: audited directly for OS-specific assumptions (no subprocess calls, no hardcoded POSIX paths, `pathlib.Path` throughout) and runs identically on Windows, see `WINDOWS.md`. One deliberate exception: `schedule` calls macOS's `launchctl`, isolated in `schedule.py` and refusing cleanly elsewhere; Windows uses Task Scheduler instead.
 - Python 3.12, managed with `uv`. Run everything through `uv run`, add dependencies with `uv add`.
 - SQLite for persistent storage. DuckDB for analytical queries over play-by-play data.
 - No GPU work and no local models. Every model call hits an API.
@@ -53,11 +53,12 @@ Work in phases. Do not skip ahead. Stop at the end of each phase, show what got 
 - **Phase 1, data layer only. Done.** Sleeper client (`src/sleeper.py`), nflverse ingestion (`src/nflverse.py`), market values from FantasyCalc (`src/market.py`), and a normalized SQLite schema written as a migration file. No rankings or projections yet. Acceptance test: print the current roster with age, position, team, market value, and 30-day value trend.
 - **Phase 2, analysis layer. Done.** Player valuation (production score, dynasty age curve, situation score, separate win-now and three-year values), contend-or-rebuild verdict with stated confidence, and trade evaluation with pick-value discounting and consolidation flags.
 - **Phase 3, weekly workflow. Done.** Vegas implied totals, opponent strength by EPA allowed, injury checks (Sleeper's structured status), weather, a win-probability lineup optimizer, FAAB sizing, and a weekly digest command.
-- **Phase 4, rookie draft prep. In progress.** A prospect board (draft capital, landing spot, age, college dominator rating, breakout age, athletic testing), pre-draft and post-draft weighting modes, taxi-slot modeling, and pick-value cross-referencing. nflverse draft capital/combine data layer built (`ingest-draft-data`). College production data source still open, no keyless free option confirmed yet (CFBD rejected, needs an email). See `PLANNING.md`.
+- **Phase 4, rookie draft prep. Done.** College production (sportsdataverse), a player id crosswalk, a prospect model fitted to real 2018+ outcomes, `prospect-board` (post-draft and labeled-weak pre-draft), rookie values in `valuate`/`trade`, `picks` (buy/hold/sell), and `taxi`. See `PLANNING.md`.
+- **Phase 5, talk to the agent. Next.** A local open-source model (Ollama, terminal chat first) that routes a plain-English question to the existing functions and explains their numbers, never computing any itself.
 
 ## Working rules
 
-- At the start of every session, including a resumed one, run `dynasty-agent sync` before anything else. Nothing here gets reasoned about from a stale cache.
+- At the start of every session, including a resumed one, run `dynasty-agent refresh` before anything else (it includes `sync`). Nothing here gets reasoned about from a stale cache.
 - Ask before assuming. If a data source or intent is unclear, ask rather than guess.
 - Every recommendation shows its inputs. The goal is an auditable chain of reasoning, not a bare verdict.
 - State what is unknown. Snap share and route participation are partly paywalled at PFF and Fantasy Points. An estimate built from public data gets labeled as an estimate.

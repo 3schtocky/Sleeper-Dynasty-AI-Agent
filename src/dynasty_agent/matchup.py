@@ -52,34 +52,25 @@ import sqlite3
 
 import duckdb
 
+from dynasty_agent import blend, nflverse
 from dynasty_agent.metrics import (
     injury_adjusted_mean,
     injury_adjusted_variance,
     matchup_win_probability,
-    sample_mean_variance,
     vegas_week_multiplier,
 )
+from dynasty_agent.prospect_model import rookie_projections
 from dynasty_agent.valuation import resolve_player, to_nflverse_team
 
-GAMES_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.parquet"
-
-
-def player_weekly_distribution(conn: sqlite3.Connection, player_id: str, season: int) -> tuple[float, float | None, int]:
-    """A player's mean and unbiased sample variance (see
-    metrics.sample_mean_variance) of weekly fantasy points in a season, from
-    real games, plus the game count backing it. variance is None for fewer
-    than 2 games, a sample variance is undefined from 0 or 1 points, that
-    includes a rookie who hasn't played yet or a kicker/defense this
-    project's nflverse ingestion doesn't carry (see nflverse.py: kicking and
-    team defense aren't in the per-player pipeline built here)."""
-    rows = [
-        r[0]
-        for r in conn.execute(
-            "SELECT fantasy_points FROM weekly_stats WHERE player_id = ? AND season = ? AND fantasy_points IS NOT NULL",
-            (player_id, str(season)),
-        ).fetchall()
-    ]
-    return sample_mean_variance(rows)
+def player_weekly_distribution(conn: sqlite3.Connection, player_id: str, season: int) -> dict:
+    """A player's blended per-game mean and variance for `season` (see
+    blend.player_distribution): last season's real games, or a rookie's
+    draft-capital projection, as a prior worth a few games, with this
+    season's real games on top. variance is None with no real sample to
+    estimate one (a rookie before his second game, or a kicker/defense this
+    project's nflverse ingestion doesn't carry)."""
+    rookie = rookie_projections(conn, season, [player_id]).get(player_id)
+    return blend.player_distribution(conn, player_id, season, rookie=rookie)
 
 
 def team_week_implied_points(season: int, week: int) -> dict[str, float]:
@@ -88,8 +79,8 @@ def team_week_implied_points(season: int, week: int) -> dict[str, float]:
     schedules file (implied = total/2 +/- spread/2). A team on a bye that
     week is simply absent from the result, not present with a fabricated
     number. Empty dict if this week's lines aren't published yet."""
+    games_path = str(nflverse.ensure_games_cached())
     con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
     try:
         rows = con.execute(
             """
@@ -97,7 +88,7 @@ def team_week_implied_points(season: int, week: int) -> dict[str, float]:
             FROM read_parquet(?)
             WHERE season = ? AND week = ? AND spread_line IS NOT NULL AND total_line IS NOT NULL
             """,
-            [GAMES_URL, season, week],
+            [games_path, season, week],
         ).fetchall()
     finally:
         con.close()
@@ -114,8 +105,8 @@ def team_season_avg_implied_points(season: int, before_week: int) -> dict[str, f
     this never uses a future week's line to describe a team's "normal."
     Empty for week 1: there is nothing prior to average yet, and
     vegas_week_multiplier treats that as a neutral 1.0, not a guess."""
+    games_path = str(nflverse.ensure_games_cached())
     con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
     try:
         rows = con.execute(
             """
@@ -123,7 +114,7 @@ def team_season_avg_implied_points(season: int, before_week: int) -> dict[str, f
             FROM read_parquet(?)
             WHERE season = ? AND week < ? AND spread_line IS NOT NULL AND total_line IS NOT NULL
             """,
-            [GAMES_URL, season, before_week],
+            [games_path, season, before_week],
         ).fetchall()
     finally:
         con.close()
@@ -147,7 +138,8 @@ def _value_matchup_side(
     variance_total = 0.0
     for name_or_id in names:
         p = resolve_player(conn, name_or_id)
-        raw_mean, raw_variance, games = player_weekly_distribution(conn, p["player_id"], season)
+        dist = player_weekly_distribution(conn, p["player_id"], season)
+        raw_mean, raw_variance, games = dist["mean"] or 0.0, dist["variance"], dist["current_games"]
         injury_mean = injury_adjusted_mean(raw_mean, p["injury_status"])
         # A None raw_variance (0 or 1 games) means there is no sample-based
         # estimate at all, not that the true variance is zero. Contributing
@@ -185,8 +177,10 @@ def _value_matchup_side(
                 "adjusted_mean": final_mean,
                 "variance": final_variance,
                 "on_bye": on_bye,
-                "thin_sample": games <= 1,
+                "thin_sample": raw_variance is None,
                 "games": games,
+                "prior_games": dist["prior_games"],
+                "value_source": dist["source"],
             }
         )
         mean_total += final_mean

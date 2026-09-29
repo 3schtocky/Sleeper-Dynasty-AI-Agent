@@ -59,6 +59,41 @@ Team pass rate over expected penalizes run-heavy offenses (Baltimore under Lamar
 ### Acceptance test
 `dynasty-agent digest` for a real week, producing a lineup recommendation and FAAB suggestions with inputs shown. Ran clean against real Week 1 2026 data.
 
+## Phase 3.5: full audit, before Phase 4
+
+A full read of every module plus live checks against the real data files, done before building Phase 4 on top of this code. Each fix below has a test in `tests/test_integration.py` or `tests/test_metrics.py` (76 tests passing, up from 58; an earlier line in this file said 55, that count was already stale).
+
+### Real bugs found and fixed
+- **Rams wind flags never fired.** `digest` passed Sleeper's `LAR` to `weather.game_wind_forecast`, whose schedule lookup uses nflverse's `LA`, so every Rams game read as a bye. The third time this exact team-code bug shape turned up. Fixed inside `game_wind_forecast` with `valuation.to_nflverse_team`. Verified live: the Rams' real Week 4 2026 game at Lincoln Financial Field now returns a real NWS forecast (5 mph).
+- **Lineup optimizer picked an arbitrary lineup whenever win probability tied.** With no opponent set, or an edge big enough that the normal CDF rounds to exactly 1.0, every lineup scores the same probability and the first one reached won, starting a 4-point RB over a 9-point WR in the flex. Found by the new integration test, not by inspection. Ties now break on projected points.
+- **nflverse cache never refreshed an in-progress season.** `ensure_cached` returned any file already on disk, so ingesting 2026 mid-season froze its stats at the first download. `ingest-nflverse` now re-downloads automatically when `--season` is the current NFL season, and `--force` does it for any season.
+- **Interrupted downloads were cached as valid forever.** Downloads wrote straight to the final path. `nflverse.download` now writes a `.part` file and renames it only once complete; `prospects.py` reuses it.
+- **Pick valuation would have broken after the 2027 rookie draft.** `PICK_VALUE_BASE_SEASON = 2027` was hardcoded. Once FantasyCalc stops listing "2027 1st", every pick's model value would have gone to None and counted as 0 in the trade market total. The base season is now the earliest season FantasyCalc actually prices (`market.priced_pick_seasons`, read live, verified against the real response: 2027 through 2029, plus Early/Mid/Late tiers for 2027 that are correctly not mistaken for seasons). Anything still unpriced is named in `trade` output instead of a silent 0.
+- **Combine ingest dropped every row with no `pfr_id`**: 1,531 of 8,968 real rows (54 of 319 in 2026). All undrafted today, however a pre-draft combine row has no PFR NFL page yet either, so the 2027 class's testing, the one real input that exists before its draft, would have been dropped. Migration `0004_combine_surrogate_key.sql` keys the table on `prospects.combine_row_id` (pfr, else cfb, else name and school), and ingestion replaces the table each run so a row gaining a `pfr_id` once drafted leaves no stale duplicate. Verified live: 8,965 rows land (up from 7,434), the 3 known duplicate `pfr_id` pairs collapsing as before, 1,531 of them with no `pfr_id`.
+- **Contend-or-rebuild measured lineup-setting, not rosters.** It summed whatever starters each manager last set in Sleeper: empty or stale all offseason, wrong for any manager who hadn't set one. Each team is now scored on the best lineup it could start (`metrics.best_lineup_total`, starters plus bench, the league's own `roster_positions`).
+- **FAAB budget was hardcoded to $100.** Now read from the league's `waiver_budget`; Sleeper's default is used and reported as a default only when the setting is absent.
+- **Retired and unsigned players counted as FAAB targets.** Valuations come from last season's stats, so anyone who retired read as an available free agent, inflating the percentile pool and able to top `digest`'s target list. The pool is now limited to players on an NFL team today.
+- **Situation score mixed postseason plays into two of its three inputs** (pass rate over expected, sack rate), while QB EPA was regular season only. All three are regular season now.
+- **`drafts`/`draft_picks` were never populated** and `DRAFT_ID` was never read. `sync` now pulls every league draft and its picks (`SleeperClient.sync_drafts`), needed for Phase 4's draft order.
+- **League renewal wasn't handled.** Sleeper gives a renewed dynasty league a new `league_id` each season; a `.env` from 2026 would keep syncing the 2026 league through the 2027 rookie draft. `sync` now checks for a renewed league (`sleeper.find_successor_league`, matched on `previous_league_id`) and prints the `init` command to switch; it never rewrites `.env` on its own. `init --league-id` now also searches next season's leagues, since Sleeper creates the renewal months before its own season rolls over.
+
+### Hardening, no live bug found
+- The `roster_weekly` crosswalk is grouped to one row per player-week. Checked live, 2025 has no duplicate; a `SELECT DISTINCT` would have written a player's week twice under two keys if a future file ever listed him with and without a `sleeper_id`.
+- The schedules file is cached locally (6-hour max age, lines move all week) instead of read over HTTP on every call, several times per player in `digest`.
+- `weekly_stats.is_estimated` is 1 on every row, on purpose: it marks `yards_per_route_run` as always the snaps-based estimate. Documented at the write site.
+
+### Still open, flagged not fixed
+- Every player with no NFL stats, the whole rostered 2026 rookie class included, is valued at 0 win-now and 0 three-year. That skews `valuate`'s verdict and `trade`'s three-year numbers. Fixing it needs the prospect model, so it is Phase 4 step 6 below, not a patch here.
+- FAAB sizing doesn't discriminate at the top: on the live run below, all five `digest` targets got the same $25 bid (every one sits near the 100th percentile of what's available, so each maxes the value multiplier), and two of them were QBs for a roster already carrying two. Roster need isn't an input yet. Not changed here, it's a Phase 3 design question, not a bug.
+
+### Verified live against the real league, after the fixes
+Run 2026-09-28, NFL week 3, 2025 season as the valuation basis.
+- `sync`: clean. The new draft sync pulled the league's one draft so far (2026 startup, complete, 252 picks); `waiver_budget` read as the real 100.
+- `ingest-nflverse --season 2025`: 18,522 player-week rows and 122,691 depth chart rows.
+- `valuate`: clean on the new best-lineup scoring. Verdict unclear (win-now 38th percentile, three-year 46th, 2 games played). All three rostered 2026 rookies show "no 2025 games", the Phase 4 gap above, confirmed live.
+- `trade --send "Jonah Coleman" --send-pick 2028-2 --receive-pick 2027-1`: clean. 2027 1st priced against the live base season with exactly 0 arbitrage, as it should. The rookie shows 0 on this project's own model beside a real 1,922 FantasyCalc price, the same gap again.
+- `digest --week 4`: clean, about 1.3 seconds (7 to 47 seconds before the schedules file was cached locally). Recommended lineup win probability 87.2%.
+
 ## Phase 4: rookie draft prep
 
 **Same constraint as Phase 3: quantitative first.** The prospect board ranks on quantifiable inputs, draft capital, college production metrics (dominator rating), breakout age, athletic testing, with stated weights per position matching this league's actual scoring, not subjective scouting takes. Where a number can be sourced and computed, it gets computed; sentiment-only inputs stay explicitly labeled as such and never substitute for a real underlying stat, the same standard Phase 2 already set with win-now/three-year value and the trade evaluator's arbitrage math.
@@ -78,17 +113,99 @@ Combined with the CFBD rejection above, this leaves pre-draft mode with no confi
 
 Also, an existing table in this project is already named `draft_picks` (this league's own Sleeper rookie-draft results). The new nflverse tables are named `nfl_draft_picks` / `nfl_combine`, confirmed the collision before naming anything, not assumed.
 
+### College production: resolved, and tested for whether it's worth having
+- [x] Source: sportsdataverse's keyless ESPN college releases (`espn_cfb_player_box`, `espn_cfb_game_rosters`, plus `cfb_team_info` and `cfb_ratings` for team context), chosen by request over CFBD. `dynasty-agent ingest-college --season 2008 --through 2026`. Real gaps found live, stated not smoothed over: ESPN lists every 2008-2013 player at position id 0 (unknown), 2020 is thin (COVID schedules, 146 teams, median 9 games), ESPN's class-year labels are wrong in places (Jeremiah Smith, a 2025 sophomore, listed JR; display only, never a model input), and FCS teams appear only in their games against FBS opponents.
+- [x] Player id crosswalk: DynastyProcess `db_playerids.csv` plus nflverse `players.parquet` into `player_ids`, built by `ingest-draft-data`. Birth dates for drafted players 97-100% per class since 2010. ESPN keeps one athlete id from college into the NFL only from about the 2018 class on (0 of ~80 linked per class 2012-2015, 25 of 83 in 2017, 76-85 from 2019), so the training set is 2018-2023 by decision: exact links over name matching.
+- [x] Fitted, not hand-set, by decision: `dynasty-agent fit-prospect-model`, ridge regression, target = league-scored points per game scheduled over the first 3 NFL seasons, scored by leaving one draft class out at a time. 429 of 475 drafted QB/RB/WR/TE used.
+
+**The finding that shaped the board: once draft capital is known, college production adds nothing.** Held-out, draft capital plus position alone scored MAE 2.68 PPG / R^2 0.443; adding dominator rating, breakout age, draft age, athleticism, conference, and team strength scored 2.70 / 0.440. Split by position it was no better: slightly worse for RB, WR, and QB, a small TE gain (0.36 to 0.41) on only 85 players, and +0.01 R^2 for picks after round 1. This league's rookie draft runs after the NFL draft, so the post-draft board ranks on draft capital and shows college inputs as context only. Consistent with published research: NFL teams already price college production into where they draft.
+
+Before the NFL draft, college production is the only signal, kept by request as a labeled-weak first read on a class for a better experience before draft order exists. Two real problems found on live runs and fixed: 1-game FCS samples with 85% dominator ratings swamped the first board (a season now needs 6+ team games and 4+ player games to count), then the board ranked San Jose State receivers above Jeremiah Smith (17th) because dominator rating can't see competition level; adding a power-conference flag and opponent-adjusted team strength moved held-out R^2 from 0.126 to 0.169 (with a real birth date) and 0.070 to 0.125 (without one, 1,840 of 1,911 eligible prospects), and put Smith first. Unrated (mostly FCS) teams sit outside the training data and are left off rather than guessed. Running backs stay under-ranked pre-draft, dominator measures receiving only; stated on the board.
+
 ### Build order
 1. [x] `draft_picks` and `combine` ingestion: `src/dynasty_agent/prospects.py`, migration `0003_prospects.sql`, `dynasty-agent ingest-draft-data`. Verified live: 12,927 real draft picks and 7,434 combine rows landed (7,437 raw rows processed; 3 real duplicate `(season, pfr_id)` keys exist in nflverse's own combine file, a data quality quirk on their end, not an ingestion bug, documented in `ingest_combine`'s docstring). Team normalization spot-checked (a real 2024 49ers pick reads back as `SF`, not `SFO`).
-2. [ ] College production ingestion (dominator rating, breakout age formulas). Blocked on picking a real source, see the reopened question above. CFBD's scaffolding (`CFBD_API_KEY` in `config.py`/`.env.example`) was added then removed by request once the email requirement surfaced.
-3. [ ] Prospect board ranking: the `--mode` CLI flag and post-draft mode (draft capital + landing spot + testing, real once the 2027 draft happens) can be built against `nfl_draft_picks`/`nfl_combine` now. Pre-draft mode waits on the college production source above, there is nothing real to rank it on yet.
-4. [ ] Position weighting to match league scoring, receivers up, quarterbacks down.
-5. [ ] Taxi-slot modeling against the 3 available slots.
-6. [ ] Cross-reference against rookie pick market values for buy, hold, or sell-the-pick guidance.
+2. [x] College production ingestion, dominator rating, breakout age (exact birth date only, by decision; "never broke out" kept separate from "unknown"), speed score, and a position-relative athletic score. See above.
+3. [x] Prospect board: `dynasty-agent prospect-board --mode post-draft|pre-draft --class <year>`. Post-draft verified live on the real 2026 class: Love, Tate, Tyson at the top, in line with FantasyCalc.
+4. [x] Position weighting to match league scoring: the board ranks on `metrics.production_score` (QB x0.70, WR x1.05), the same weighting `valuate` uses; Mendoza drops from 1st on raw PPG to 4th.
+5. [x] Taxi and IR planning: `dynasty-agent taxi`. Every rule from the league's own settings (taxi_slots, taxi_years, taxi_allow_vets, taxi_deadline, reserve_slots, the reserve_allow_* flags). Moves: IR-eligible players outside this week's best lineup to open IR slots, then taxi-eligible ones to open taxi slots, most long-term value first; next season's crunch counts carryover players, graduating taxi players, and next-draft picks against active plus taxi room (IR not counted, it's temporary), naming the lowest three-year-value non-rookie non-starters as cut candidates. Two real bugs caught on the first live run and fixed: an IR rookie was counted as a starter (the lineup check now skips IR/Out/Suspended players), and the lineup check used win-now value, whose age curve kept a 4.4 PPG rookie "active" over a 29-year-old RB averaging 11.7 (this week's lineup now picks by projected points). Live: the user's roster was 18 of 18 active with 3 empty taxi slots and an open IR slot; the plan moves Jonah Coleman to IR and Emmett Johnson and Demond Claiborne to taxi, freeing 3 bench spots, and next season fits (21 players, 21 spots).
+6. [x] Pick advice: `dynasty-agent picks` (`--all` for every team). Inventory from Sleeper's `traded_picks` (only traded picks are listed; the rest belong to their original roster), next three drafts. The next draft's slots are projected reverse standings: best-lineup win-now strength blended toward real record by games played (14% two games in). Advice is market against market: FantasyCalc's price for the projected tier ("2027 1st (Mid)") against FantasyCalc's current value for the 2026 rookies taken at that same slot (ranked by the draft-capital board, slots either side pooled); over 1.15x sell, under 0.87x buy (round, stated bands). Each slot's history since 2018 (league-weighted PPG over 3 seasons, rate of reaching 10+, a weekly flex starter) shown alongside. Live, the user's picks (projected 6th in each round): 2027 1.06 priced 3,040 against a 2,268 median for Makai Lemon, KC Concepcion, and Kenyon Sadiq, SELL at 1.34x; 2.06 HOLD at 1.06x; 3.06 priced 1,012 against 173, SELL at 5.85x, with that slot's rookies averaging 3.5 PPG and 0% reaching flex-starter level since 2018. League-wide, only 1.01 holds (0.97x against Love-tier rookies). This matches a known dynasty-market pattern, unknown picks price above the players they become, and CLAUDE.md's own note that late picks are near-worthless in a 3-round draft.
 7. [ ] Later, not yet scoped: the labeled mock-draft-consensus layer described above.
+8. [x] Acceptance test, see below.
 
-### Acceptance test
-A ranked prospect board for the next rookie draft, with a recommendation on any picks currently held. Not built yet; `ingest-draft-data` is the data layer underneath it.
+### Acceptance test: passed
+A ranked prospect board for the next rookie draft, with a recommendation on any picks currently held.
+- Board: `prospect-board --mode post-draft --class 2026` against FantasyCalc's current values for the same 61 rookies: Spearman rank correlation 0.814; 10 of the board's top 12 are in the market's top 13 (Love, Tate, Tyson at the top of both). The biggest disagreement is on the user's own roster: Emmett Johnson, board rank 36 (pick 161), market rank 11, the market pricing him well above what his draft slot has historically returned, a sell-high signal. For 2027, `--mode pre-draft` gives the labeled-weak first read until that draft happens, then `--mode post-draft`.
+- Picks: `dynasty-agent picks` gives a projected slot, that slot's real history, FantasyCalc's price, and buy/hold/sell for every pick held (live: 2027 1.06 SELL, 2.06 HOLD, 3.06 SELL).
+- Taxi: `dynasty-agent taxi` (live: 3 bench spots freed).
+
+**Phase 4 status: done**, pending the user's approval per the phase rule. Later, not scoped: the labeled mock-draft consensus sentiment layer.
+
+## Phase 5: talk to the agent (planned, not started)
+
+Goal: ask "should I trade Coleman and a 2028 2nd for a 2027 1st?" or "who do I start this week?" in plain English, answered by an open-source model running locally on the MacBook Air M4 (16GB), instead of typing `uv run` commands.
+
+### Decisions confirmed with the user
+- Runtime: Ollama, chosen as the easiest to understand and build with (`ollama pull qwen3:4b`; `ollama run` to try the bare model by hand; a plain local HTTP API the existing `httpx` reaches, no new Python dependency).
+- Interface: terminal chat first (`dynasty-agent chat`); a local web page can come later on the same core.
+
+### Core design: the model routes and explains, Python computes every number
+A ~4B model is fine at understanding a question and phrasing an answer, unreliable at arithmetic and recall. It never computes or remembers a stat: it picks a tool, the existing deterministic function runs, and it explains the returned numbers. That keeps this file's rules true in chat: every recommendation shows its inputs, no projection that can't trace to the database.
+
+Tools, thin wrappers over functions that already return dicts, flat arguments, a small set so a 4B model routes reliably: valuate / my roster, evaluate_trade, set_lineup (optimize_lineup), faab_bid and waiver_targets, predict_matchup, game_conditions (weather and schedule), prospect_board, picks, taxi. Player names stay resolved by `valuation.resolve_player`; an ambiguous name ("Justin Jefferson" matches a WR and an LB) comes back as a clarifying question, never a guess.
+
+### Step 0, runtime verified before any project code (2026-09-28)
+Ollama 0.34.4 installed and serving on localhost:11434, 336 GB free, the MacBook Air M4 runs a 4B model 100% on GPU at 3.9 GB.
+
+Model candidates, tested raw against Ollama's API with the same tool definitions and questions:
+- `qwen3:4b` (the reasoning model, 4.0B, Q4_K_M, reports tools support): routed both test questions correctly, however took a median ~50s per turn warm. Diagnosed, not guessed: 33 tokens/s generation, a normal speed, spent on ~400 tokens of reasoning before every tool call, even with Ollama's `think: false` (the reasoning moved into the visible answer instead of the thinking channel). Qwen's `/no_think` switch cut it only to 264 tokens. Also invented a fact it couldn't know (asked for week 1 in week 4).
+- `qwen3:4b-instruct` (same size, non-reasoning): median 1.6s per turn warm (0.6-1.9s; 18.5s once to load into memory), ~35 tokens generated, routed both questions correctly, invented nothing. The working choice; the bake-off in step 6 still decides it on a full question set.
+
+**Full bake-off, the same day** (`benchmarks/model_bench.py`: 16 real questions scored on tool and arguments, 3 answer tests scored on quoting the tool's real numbers without inventing any, writing speed), prompted by a goal of ~60 tokens/s. Generation is memory-bandwidth bound, so the levers were a smaller dense model, a mixture-of-experts model with ~1B active parameters, or lower-bit quantization (ruled out, quality cost):
+
+| Model | Tok/s fresh | Routing | Answers | Outcome |
+|---|---|---|---|---|
+| `qwen3:4b-instruct` | ~35 | 16/16 every run | 2/3 | chosen: never misrouted, never invented a number |
+| `gemma4:e2b` | ~50 | 15/16 | 1/3 | reversed "I'm offered X for Y" trades every run |
+| `qwen3.5:4b` | ~22 | 15/16 | 3/3 | best answers, 7.4s to pick a tool |
+| `qwen3.5:2b` (8-bit) | ~42 | 14/16 | 0/3 | listed draft picks as players |
+| `qwen3.5:2b-q4_K_M` | ~44 | - | - | Ollama's template errors on a tool call with no arguments ("XML syntax error"), a real compatibility bug for tools like set_lineup |
+| `qwen3:1.7b` | ~68 | 13/16 | 2/3 | swapped trade sides, turned a 2nd into a 1st, looked up Tom Brady for a pick question |
+| `granite4:7b-a1b-h` (MoE) | ~50 | 10/16 | 1/3 | flipped trades, invented a "2024 1st" |
+| `lfm2.5:8b-a1b` (MoE) | ~68 | 8/16 | 2/3 | reasons in `<think>` tags even with thinking off, ran out of budget before calling a tool |
+
+Conclusion, stated plainly: on a fanless MacBook Air M4, no tested model reaches 60 tokens/s while handling trades correctly; the two that reach it swap trade sides or spend the speed reasoning. Sustained load also throttles the fanless Air (re-timed after ~40 minutes of benchmarks, every model ran 20-45% slower; the chosen model fell from 35 to 19). A model that confidently evaluates the reverse of the user's trade is the worst failure this tool can have, so speed is designed for instead: Python writes the numbers block itself (instant, can't be misquoted), the model adds 1-3 sentences (~60 tokens, ~2s), output streams, the model is loaded while `refresh` runs so no cold start, and the model is a setting so a faster Mac can run a larger one.
+
+Two harness bugs of this project's own, found and fixed before trusting any score: "answer using only the numbers" made models reply with bare numbers, and a placeholder tool call in the grounding test crashed Qwen3.5's template; both reworded to match a real conversation.
+
+Models live in `~/Open Source Models` (the user's choice, outside the repo; `~/.ollama/models` links to it), inventoried in `MODELS.md` there.
+
+Design rules this surfaced, before any code: never ask the model for anything Python already knows (current week, the user's roster, the season), Python fills those in; and accept any reasonable argument format from the model (it wrote picks as "2027-1" in one run and "2027 1st" in the next), the tool layer normalizes.
+
+### User experience target
+`git clone`, then `uv run dynasty-agent` with no arguments opens a first-run setup: checks Ollama and downloads the model (saying the size first), asks the Sleeper username and league, loads the data with progress (replacing today's five first-run commands), asks what matters to the user (contending, rebuilding, trades, waivers, rookies), offers the daily refresh, then opens the chat with a short brief tuned to those priorities. Before building it, the user will run a first-time install from GitHub by hand to find where today's onboarding breaks.
+
+### Build order
+1. [ ] Refactor: move printing out of `cli.py` into formatters, extract `digest` assembly into `weekly.py`, so the CLI and chat share one path returning plain dicts.
+2. [ ] `llm.py`: a minimal Ollama client (`POST /api/chat` with tools), model and URL from `.env`.
+3. [ ] `tools.py`: tool schemas and dispatch; every result carries its inputs and data basis.
+4. [ ] `dynasty-agent chat`: `refresh` first (the working rule), then a conversation loop; shows which tool ran, `/raw` prints the underlying numbers.
+5. [ ] Grounding check: every number in an answer must appear in that turn's tool output, else the raw output is shown instead; draft-model caveats carried through.
+6. [ ] Evaluation set: ~40 real questions with the expected tool and arguments, offline routing tests plus a live `chat-eval`; a bake-off of 2-3 ~4B models, picked by result.
+7. [ ] Docs: this file's "No GPU work and no local models" rule changes deliberately, with the reason recorded; Ollama install steps in README and WINDOWS.md.
+
+### Stated limits
+- Sleeper's API is read-only: the agent recommends a lineup, bid, trade, or taxi move; the user makes it in the Sleeper app.
+- A small model will sometimes misroute; the grounding check and eval set measure and contain that, not claim it never happens.
+
+## Staying current in season
+
+Found by asking "will this stay up to date?": it didn't. Nothing ran on its own, the 2026 season's stats sat un-ingested three weeks in, and ingesting them would have switched every value from 17 games of 2025 to 3 noisy games of 2026 in one step.
+
+- [x] **Blend, don't switch.** Every per-game average (valuations, matchups, lineups) starts from last season's and this season's real games add on top; team situation scores blend the same way by games played. A rookie starts from his draft-capital projection instead. How much the prior counts was chosen by backtest (`calibrate-blend`, `blend.py`): blend the prior with the first 1-8 weeks, score against the rest of the season. Veterans, 2024 into 2025, 1,231 players: best at 4 games (MAE 0.883 PPG against 1.082 for this season alone; flat from 3 to 6). Rookies, the 2025 class, outside the model's training range, 71 players: best at 3 games (3.032 against 3.454). One season pair each, rerun as more accumulate. Verified live on 2026 through week 3: CeeDee Lamb 19.0 PPG and Rashee Rice 16.1, blending 3 real games into last season; the user's rookies moving off their projections (Emmett Johnson 4.4 after 3 games).
+- [x] **`refresh`**: one command that knows the calendar (see `refresh.py`), each step independent so one failure doesn't stop the rest, ending in a freshness report. The prospect model's training window now moves forward on its own (2018 through the newest class with 3 completed seasons) and refits when it does. 3-4 seconds on a live run.
+- [x] **`schedule`**: a daily `refresh` through launchd, verified by triggering the installed job through launchd itself (its stripped-down environment, not a terminal): 5 of 5 steps ok. Windows gets the `schtasks` equivalent in `WINDOWS.md`, written from Microsoft's documented syntax, not yet run on Windows.
+- [x] **Real bug found on the way**: `ingest-nflverse` crashed for every season before 2025. nflverse's depth chart format changed in 2025 (dated snapshots, `pos_abb`); older seasons are week-numbered (`club_code`, `depth_team`). Both handled now, 2024 verified.
+- [x] **Found live, reported to the user**: Jonah Coleman is on IR in Sleeper as of week 4.
 
 ## Out-of-band: ad hoc matchup prediction — DRAFT
 
