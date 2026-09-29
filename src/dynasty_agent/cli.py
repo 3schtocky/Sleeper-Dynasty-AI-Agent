@@ -7,21 +7,10 @@ import json
 import sys
 from datetime import datetime
 
-from dynasty_agent import blend, college, config, market, matchup, nflverse, picks, prospect_model, prospects, refresh, schedule, sleeper, taxi, valuation, weather, weekly
+from dynasty_agent import blend, college, config, context, market, matchup, nflverse, picks, prospect_model, prospects, refresh, schedule, sleeper, taxi, valuation, weather, weekly
 from dynasty_agent.db import get_db
+from dynasty_agent.errors import AgentError
 from dynasty_agent.sleeper import SleeperClient
-
-
-def _require_config() -> None:
-    missing = config.missing_config()
-    if missing:
-        print(
-            f"Missing config: {', '.join(missing)}. Run "
-            f"`dynasty-agent init --username <your sleeper username>` to set it up, "
-            f"or copy .env.example to .env and fill it in by hand.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -74,7 +63,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
     with SleeperClient(conn) as client:
         client.sync_all()
@@ -95,14 +84,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
 
 def cmd_roster(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
-    ).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
     rows = conn.execute(
         """
@@ -119,7 +103,7 @@ def cmd_roster(args: argparse.Namespace) -> None:
         ORDER BY CASE rp.slot WHEN 'starter' THEN 0 WHEN 'bench' THEN 1 WHEN 'taxi' THEN 2 ELSE 3 END,
                  mv.value DESC
         """,
-        (roster["roster_id"],),
+        (me,),
     ).fetchall()
 
     slot_labels = {"starter": "START", "bench": "BENCH", "taxi": "TAXI", "reserve": "IR"}
@@ -178,7 +162,7 @@ def cmd_fit_prospect_model(args: argparse.Namespace) -> None:
     if league is None:
         print("No league data cached yet. Run `dynasty-agent sync` first.", file=sys.stderr)
         raise SystemExit(1)
-    report = prospect_model.fit_and_store(conn, json.loads(league["scoring_settings_json"]), _latest_complete_season(conn))
+    report = prospect_model.fit_and_store(conn, json.loads(league["scoring_settings_json"]), context.latest_complete_season(conn))
     cov = report["coverage"]
     first, last = report["classes"]
     print(f"Prospect model fit on the {first}-{last} draft classes, drafted QB/RB/WR/TE, your league's scoring.")
@@ -303,7 +287,7 @@ def cmd_prospect_board(args: argparse.Namespace) -> None:
 
 
 def cmd_refresh(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
     started = datetime.now()
     print(f"=== dynasty-agent refresh, {started:%Y-%m-%d %H:%M} ===")
@@ -322,18 +306,14 @@ def cmd_refresh(args: argparse.Namespace) -> None:
 
 
 def cmd_picks(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent refresh` first.", file=sys.stderr)
-        raise SystemExit(1)
-    stats_season = _latest_ingested_season(conn)
-    league = conn.execute("SELECT scoring_settings_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    me = context.my_roster_id(conn)
+    stats_season = context.stats_season(conn)
     try:
         report = picks.pick_report(
-            conn, stats_season, roster["roster_id"], _latest_complete_season(conn),
-            json.loads(league["scoring_settings_json"]), None if args.all else roster["roster_id"],
+            conn, stats_season, me, context.latest_complete_season(conn),
+            context.scoring_settings(conn), None if args.all else me,
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -345,7 +325,6 @@ def cmd_picks(args: argparse.Namespace) -> None:
             "SELECT ro.roster_id, u.display_name, u.team_name FROM rosters ro LEFT JOIN users u ON u.user_id = ro.owner_id"
         )
     }
-    me = roster["roster_id"]
     weight = report["record_weight"]
     print(f"Rookie picks, {'every team' if args.all else 'yours'}. Next draft: {report['next_draft']}.")
     print(
@@ -391,14 +370,11 @@ def cmd_picks(args: argparse.Namespace) -> None:
 
 
 def cmd_taxi(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent refresh` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
     try:
-        result = taxi.plan(conn, _latest_ingested_season(conn), roster["roster_id"])
+        result = taxi.plan(conn, context.stats_season(conn), me)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
@@ -462,7 +438,7 @@ def cmd_schedule(args: argparse.Namespace) -> None:
 
 def cmd_calibrate_blend(args: argparse.Namespace) -> None:
     conn = get_db()
-    season = args.season or _latest_complete_season(conn)
+    season = args.season or context.latest_complete_season(conn)
     try:
         vets, n_vets = blend.backtest_veterans(conn, season - 1, season)
         rookies, n_rookies = blend.backtest_rookies(conn, season)
@@ -487,34 +463,12 @@ def cmd_calibrate_blend(args: argparse.Namespace) -> None:
     print("\nThe constants in use live in blend.py with the run they came from; change them there if a new season disagrees.")
 
 
-def _latest_complete_season(conn) -> int:
-    """The most recent NFL season with every regular-season week played."""
-    row = conn.execute("SELECT season, season_type FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
-    if row is None or row["season"] is None:
-        print("No synced NFL state. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
-    return refresh.latest_complete_season(int(row["season"]), row["season_type"])
-
-
-def _latest_ingested_season(conn) -> int | None:
-    row = conn.execute("SELECT max(season) FROM weekly_stats").fetchone()
-    return int(row[0]) if row and row[0] is not None else None
-
-
 def cmd_valuate(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
-    ).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    season = args.season or _latest_ingested_season(conn)
-    if season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
+    season = context.stats_season(conn, args.season)
 
     valuations = valuation.player_valuations(conn, season)
     print(_basis_line(season))
@@ -527,7 +481,7 @@ def cmd_valuate(args: argparse.Namespace) -> None:
     my_players = conn.execute(
         "SELECT rp.player_id, rp.slot, p.full_name, p.position, p.age FROM roster_players rp "
         "JOIN players p ON p.player_id = rp.player_id WHERE rp.roster_id = ?",
-        (roster["roster_id"],),
+        (me,),
     ).fetchall()
 
     slot_order = {"starter": 0, "bench": 1, "taxi": 2, "reserve": 3}
@@ -561,7 +515,7 @@ def cmd_valuate(args: argparse.Namespace) -> None:
     if any(valuations.get(r["player_id"], {}).get("value_source") == "prospect_model" for r in my_players):
         print(_ROOKIE_FOOTNOTE)
 
-    verdict = valuation.contend_or_rebuild(conn, season, roster["roster_id"])
+    verdict = valuation.contend_or_rebuild(conn, season, me)
     print()
     print(f"Verdict: {verdict['verdict'].upper()}")
     print(f"Confidence: {verdict['confidence']}")
@@ -611,19 +565,11 @@ def _parse_pick(spec: str) -> tuple[int, int]:
 
 
 def cmd_trade(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
-    ).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    season = args.season or _latest_ingested_season(conn)
-    if season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
+    season = context.stats_season(conn, args.season)
 
     try:
         send_picks = [_parse_pick(p) for p in (args.send_pick or [])]
@@ -631,7 +577,7 @@ def cmd_trade(args: argparse.Namespace) -> None:
         result = valuation.evaluate_trade(
             conn,
             season,
-            roster["roster_id"],
+            me,
             send_players=args.send or [],
             send_picks=send_picks,
             receive_players=args.receive or [],
@@ -693,38 +639,15 @@ def cmd_trade(args: argparse.Namespace) -> None:
         print(f"Note: {result['consolidation']}")
 
 
-def _resolve_vegas_season(conn, explicit_vegas_season: int | None) -> int:
-    """The season --week's Vegas lines belong to. The real current NFL
-    season from the last sync when not given explicitly, never inferred
-    from the FPPG baseline season: week 1 of a completed season already
-    has real closing lines from last year's game, so any presence-based
-    fallback silently prices the wrong year. See matchup.predict_matchup's
-    docstring for the bug this replaced."""
-    if explicit_vegas_season is not None:
-        return explicit_vegas_season
-    state_row = conn.execute("SELECT season FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
-    if state_row is None:
-        print(
-            "No synced NFL state to determine the current season. Run `dynasty-agent sync` first, "
-            "or pass --vegas-season explicitly.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    return int(state_row["season"])
-
-
 def cmd_predict_matchup(args: argparse.Namespace) -> None:
     conn = get_db()
     if conn.execute("SELECT 1 FROM players LIMIT 1").fetchone() is None:
         print("No player data yet. Run `dynasty-agent init` and `dynasty-agent sync` first.", file=sys.stderr)
         raise SystemExit(1)
 
-    season = args.season or _latest_ingested_season(conn)
-    if season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
+    season = context.stats_season(conn, args.season)
 
-    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+    vegas_season = context.vegas_season(conn, args.vegas_season)
 
     try:
         result = matchup.predict_matchup(conn, season, vegas_season, args.week, args.team_a or [], args.team_b or [])
@@ -771,24 +694,18 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
 
 
 def cmd_optimize_lineup(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    stats_season = args.season or _latest_ingested_season(conn)
-    if stats_season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
-    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+    stats_season = context.stats_season(conn, args.season)
+    vegas_season = context.vegas_season(conn, args.vegas_season)
 
     with SleeperClient(conn) as client:
         client.sync_matchups(args.week)
 
     try:
-        result = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, roster["roster_id"])
+        result = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, me)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
@@ -835,20 +752,14 @@ def cmd_optimize_lineup(args: argparse.Namespace) -> None:
 
 
 def cmd_faab(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    stats_season = args.season or _latest_ingested_season(conn)
-    if stats_season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
+    stats_season = context.stats_season(conn, args.season)
 
     try:
-        result = weekly.faab_recommendation(conn, stats_season, roster["roster_id"], args.player)
+        result = weekly.faab_recommendation(conn, stats_season, me, args.player)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
@@ -874,18 +785,12 @@ def cmd_faab(args: argparse.Namespace) -> None:
 
 
 def cmd_digest(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    stats_season = args.season or _latest_ingested_season(conn)
-    if stats_season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
-    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+    stats_season = context.stats_season(conn, args.season)
+    vegas_season = context.vegas_season(conn, args.vegas_season)
 
     with SleeperClient(conn) as client:
         client.sync_matchups(args.week)
@@ -893,7 +798,7 @@ def cmd_digest(args: argparse.Namespace) -> None:
     print(f"=== Week {args.week} digest, {stats_season} season FPPG basis, {vegas_season} season Vegas lines ===\n")
 
     try:
-        lineup = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, roster["roster_id"])
+        lineup = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, me)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
@@ -918,8 +823,13 @@ def cmd_digest(args: argparse.Namespace) -> None:
     for p in sorted(lineup["bench"], key=lambda p: -p["mean"])[:5]:
         print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}")
 
+    try:
+        targets = weekly.top_faab_targets(conn, stats_season, me)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
     print("\nFAAB targets (highest win-now value actually available on waivers right now):")
-    for bid in weekly.top_faab_targets(conn, stats_season, roster["roster_id"]):
+    for bid in targets:
         print(f"  {bid['player']:<20} {bid['position']:<3} value={bid['target_win_now_value']:>5.1f}  suggested bid ${bid['suggested_bid']}")
 
     print("\nThis is DRAFT-heuristic math throughout (see matchup.py, PLANNING.md), not a calibrated prediction.")
@@ -1128,7 +1038,11 @@ def main() -> None:
     digest_parser.set_defaults(func=cmd_digest)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except AgentError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
