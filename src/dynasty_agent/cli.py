@@ -772,21 +772,33 @@ def cmd_faab(args: argparse.Namespace) -> None:
     print(f"FAAB recommendation for {result['player']} ({result['position']})")
     if result["is_rostered"]:
         print("Warning: this player is already on a roster in your league, not actually a free agent right now.")
+    if result["note"]:
+        print(result["note"])
     budget_note = " (league settings carry no waiver_budget, assumed Sleeper's default)" if result["budget_is_default"] else ""
+    window = "before the playoffs" if result["phase"] == "regular" else "of playoffs"
     print(
         f"\nRemaining budget: ${result['remaining_budget']} of ${result['total_budget']}{budget_note}, "
-        f"{result['weeks_left']} weeks left before the playoffs."
+        f"{result['weeks_left']} weeks left {window}."
     )
     print(
-        f"Win-now value: {result['target_win_now_value']:.1f} "
-        f"({result['percentile_among_available']:.0f}th percentile among players actually available on waivers, "
-        f"not everyone in the league)."
+        f"Win-now value: {result['target_win_now_value']:.1f} points-per-game scale "
+        f"({result['percentile_among_available']:.0f}th percentile among players actually available on waivers)."
     )
+    print(_gain_line(result))
     print(
         f"Base pace, remaining budget split evenly across the weeks left: ${result['base_per_week_budget']:.2f}/week, "
-        f"scaled ×{result['value_multiplier']:.2f} for this target's value."
+        f"scaled ×{result['value_multiplier']:.2f} for this target's lineup gain."
     )
-    print(f"\nSuggested bid: ${result['suggested_bid']}")
+    print(f"\nSuggested bid: ${result['suggested_bid']} (FAAB dollars)")
+
+
+def _gain_line(bid: dict) -> str:
+    if bid["lineup_gain"] <= 0:
+        return "Lineup gain: none, this player wouldn't start for you, so it's a token bid for depth only."
+    return (
+        f"Lineup gain: +{bid['lineup_gain']:.1f} to your best lineup's win-now total "
+        f"(the biggest upgrade on waivers is +{bid['best_available_gain']:.1f})."
+    )
 
 
 def cmd_digest(args: argparse.Namespace) -> None:
@@ -838,9 +850,17 @@ def cmd_digest(args: argparse.Namespace) -> None:
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
-    print("\nFAAB targets (highest win-now value actually available on waivers right now):")
+    print("\nFAAB targets (the waiver players who would raise your best lineup the most):")
+    if targets and targets[0]["note"]:
+        print(f"  {targets[0]['note']}")
     for bid in targets:
-        print(f"  {bid['player']:<20} {bid['position']:<3} value={bid['target_win_now_value']:>5.1f}  suggested bid ${bid['suggested_bid']}")
+        gain = f"+{bid['lineup_gain']:.1f} to lineup" if bid["lineup_gain"] > 0 else "depth only"
+        print(
+            f"  {bid['player']:<20} {bid['position']:<3} win-now {bid['target_win_now_value']:>5.1f}  {gain:<16} "
+            f"suggested bid ${bid['suggested_bid']}"
+        )
+    if not targets:
+        print("  none: nobody available has a win-now value this season.")
 
     print("\nThis is DRAFT-heuristic math throughout (see matchup.py, PLANNING.md), not a calibrated prediction.")
 
