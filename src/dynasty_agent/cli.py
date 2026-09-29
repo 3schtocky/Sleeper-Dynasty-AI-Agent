@@ -520,6 +520,13 @@ def cmd_digest(args: argparse.Namespace) -> None:
     print(formatters.format_digest(lineup, targets, winds, stats_season, vegas_season, sync_note))
 
 
+def cmd_chat(args: argparse.Namespace) -> None:
+    from dynasty_agent import chat
+
+    context.require_config()
+    chat.run(get_db(), do_refresh=not args.no_refresh)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="dynasty-agent", description="Dynasty fantasy football agent for a Sleeper league."
@@ -724,6 +731,17 @@ def main() -> None:
         help="Season --week's Vegas lines belong to. Defaults to the real current NFL season from the last sync.",
     )
     digest_parser.set_defaults(func=cmd_digest)
+
+    chat_parser = sub.add_parser(
+        "chat",
+        help="[Phase 5 preview] Ask about your league in plain English, answered by a local model (Ollama) that "
+        "routes to these commands; every number comes from them, not the model.",
+    )
+    chat_parser.add_argument(
+        "--no-refresh", action="store_true",
+        help="Skip the session-start refresh (quicker restarts; the data may be stale).",
+    )
+    chat_parser.set_defaults(func=cmd_chat)
 
     args = parser.parse_args()
     try:

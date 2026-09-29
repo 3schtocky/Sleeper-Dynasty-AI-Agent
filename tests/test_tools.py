@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from dynasty_agent import config, market, tools
-from tests.test_integration import add_player, fake_pick_values, trade_league
+from dynasty_agent import config, tools
+from tests.test_integration import add_player, trade_league
 
 
 def test_no_tool_asks_the_model_for_week_season_or_roster():
@@ -84,3 +84,14 @@ def test_compact_results_are_json_ready(league):
     r = tools.run_tool(league, "my_team", {})
     json.dumps(r.compact)
     assert r.compact["verdict"] in ("contend", "rebuild", "unclear")
+
+
+def test_a_hint_in_parentheses_settles_which_player(league):
+    add_player(league, "kw1", "RB", 9.0)
+    add_player(league, "kw2", "WR", 3.0, team=None)
+    league.execute("UPDATE players SET full_name = 'Kenneth Walker' WHERE player_id IN ('kw1', 'kw2')")
+    for name in ("Kenneth Walker (RB)", "Kenneth Walker (RB KC)", "Kenneth Walker III (KC)"):
+        r = tools.run_tool(league, "evaluate_trade", {"receive_players": [name], "send_players": ["Jonah Coleman"]})
+        assert r.clarification is None and r.compact["user_receives"][0].startswith("Kenneth Walker"), name
+    r = tools.run_tool(league, "evaluate_trade", {"receive_players": ["Kenneth Walker (QB)"], "send_players": ["Jonah Coleman"]})
+    assert r.clarification.startswith("Which Kenneth Walker")  # a hint that fits neither still asks

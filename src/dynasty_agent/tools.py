@@ -50,7 +50,7 @@ TOOLS = [
         "Free agents worth picking up and suggested FAAB bids. Give player for one specific player's bid.",
         {
             "player": {"type": "string", "description": "Optional: one free agent to size a bid for."},
-            "position": {"type": "string", "description": "Optional: QB, RB, WR or TE."},
+            "position": {"type": "string", "description": "Only if the user names a position: QB, RB, WR or TE."},
         },
     ),
     _tool("pick_advice", "Buy, hold or sell advice for the user's rookie draft picks."),
@@ -97,6 +97,29 @@ def _split_players_and_picks(players: list[str], pick_specs: list[str]) -> tuple
     return real_players, specs
 
 
+_HINT = re.compile(r"^(.*?)\s*\(([^)]*)\)\s*$")
+
+
+def _pin(conn: sqlite3.Connection, name: str) -> str:
+    """A name with a hint in parentheses, the way the model answers "Which
+    Kenneth Walker?" ("Kenneth Walker (RB)", "Kenneth Walker (RB KC)"),
+    resolves to that player's id when the hint picks exactly one of the
+    candidates. Anything else passes through for resolve_player to handle."""
+    m = _HINT.match(name)
+    if not m:
+        return name
+    base, hint = m.group(1).strip(), {t.upper() for t in re.split(r"[\s,/]+", m.group(2)) if t}
+    try:
+        return valuation.resolve_player(conn, base)["player_id"]
+    except AmbiguousPlayer as e:
+        fits = [c for c in e.candidates if hint & {c["position"], c["team"] or "FA"}]
+        if len(fits) == 1:
+            return fits[0]["player_id"]
+        raise
+    except PlayerNotFound:
+        return base
+
+
 def _clarify(e: ValueError) -> str:
     if isinstance(e, AmbiguousPlayer):
         options = [f"{c['full_name']} ({c['position']} {c['team'] or 'FA'})" for c in e.candidates]
@@ -134,7 +157,20 @@ def _set_lineup(conn, me, season, args) -> ToolResult:
     note = weekly.sync_matchups_or_note(conn, week)
     r = weekly.optimize_lineup(conn, season, vegas, week, me)
     prob = r["recommended_win_probability"]
+    # The closest call: the best benched player, and the starter at his
+    # position he'd replace (the lowest projected one).
+    bench_note = None
+    top_bench = max(r["bench"], key=lambda p: p["mean"], default=None)
+    if top_bench is not None:
+        same = [p for p in r["recommended_lineup"] if p["position"] == top_bench["position"]]
+        if same:
+            over = min(same, key=lambda p: p["mean"])
+            bench_note = (f"{over['full_name']} ({over['mean']:.1f}) starts over {top_bench['full_name']} "
+                          f"({top_bench['mean']:.1f})")
     compact = {
+        "headline": (f"start the recommended lineup, win probability {prob:.1%} against a projected "
+                     f"{r['opponent_mean']:.1f}" if prob is not None else "start the recommended lineup, the most projected points")
+                    + (f"; {bench_note}" if bench_note else ""),
         "week": week,
         "starters": [f"{p['full_name']} {p['position']} {p['mean']:.1f}" + formatters.why_zero(p) for p in r["recommended_lineup"]],
         "win_probability": f"{prob:.1%}" if prob is not None else "n/a",
@@ -155,6 +191,8 @@ def _evaluate_trade(conn, me, season, args) -> ToolResult:
     )
     if not (send_players or send_specs or receive_players or receive_specs):
         return ToolResult("evaluate_trade", clarification="What would you send and what would you get back?")
+    send_players = [_pin(conn, n) for n in send_players]
+    receive_players = [_pin(conn, n) for n in receive_players]
     send_picks = [picks.parse_league_pick(conn, s) for s in send_specs]
     receive_picks = [picks.parse_league_pick(conn, s) for s in receive_specs]
     r = valuation.evaluate_trade(conn, season, me, send_players, send_picks, receive_players, receive_picks,
@@ -202,6 +240,7 @@ def _my_team(conn, me, season, args) -> ToolResult:
 def _waiver_targets(conn, me, season, args) -> ToolResult:
     player = (args.get("player") or "").strip()
     if player:
+        player = _pin(conn, player)
         r = weekly.faab_recommendation(conn, season, me, player)
         compact = {
             "player": f"{r['player']} {r['position']}",
@@ -216,7 +255,10 @@ def _waiver_targets(conn, me, season, args) -> ToolResult:
     if position not in (None, "QB", "RB", "WR", "TE"):
         position = None
     targets = weekly.top_faab_targets(conn, season, me, position=position)
+    top = targets[0] if targets else None
     compact = {
+        "headline": (f"best pickup: {top['player']} {top['position']}, bid ${top['suggested_bid']}" if top and top["lineup_gain"] > 0
+                     else "nobody on waivers would start for you; any pickup is depth only"),
         "targets": [
             f"{t['player']} {t['position']}: " + (f"+{t['lineup_gain']:.1f} to lineup" if t["lineup_gain"] > 0 else "depth only")
             + f", bid ${t['suggested_bid']}"
@@ -247,11 +289,14 @@ def _pick_advice(conn, me, season, args) -> ToolResult:
 
 def _taxi_plan(conn, me, season, args) -> ToolResult:
     r = taxi.plan(conn, season, me)
+    moves = [f"move {m['player']['full_name']} to {m['to']} ({m['why']})" for m in r["moves"]]
     compact = {
-        "moves": [f"{m['player']['full_name']} to {m['to']}: {m['why']}" for m in r["moves"]],
-        "taxi_locked": r["taxi_locked"],
-        "next_season_cuts_needed": max(r["overflow"], 0),
-        "cut_candidates": [p["full_name"] for p in r["cut_candidates"]],
+        "recommendation": moves or ["no moves: every open taxi and IR slot is filled or has no eligible player"],
+        "taxi_moves_locked_by_deadline": r["taxi_locked"],
+        "next_season": (
+            f"roster crunch, cut candidates: {', '.join(p['full_name'] for p in r['cut_candidates']) or 'none named'}"
+            if r["overflow"] > 0 else "everyone fits next season, no cuts needed"
+        ),
     }
     return ToolResult("taxi_plan", formatters.format_taxi(r), compact)
 
