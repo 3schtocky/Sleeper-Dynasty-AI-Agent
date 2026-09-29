@@ -22,15 +22,27 @@ BASE_URL = "https://api.fantasycalc.com/values/current"
 CACHE_TTL_SECONDS = 6 * 3600
 
 
+# The parsed response per (cache key, fetched_at): pricing a pick report's
+# picks read and re-parsed the same ~400 KB response 250 times per run.
+# Keyed on fetched_at, so a refetch is seen immediately. Callers must not
+# mutate the returned list.
+_parsed: dict[str, tuple[str, list[dict]]] = {}
+
+
 def fetch_values(conn: sqlite3.Connection) -> list[dict]:
     cache_key = "fantasycalc:values/current:" + json.dumps(FANTASYCALC_PARAMS, sort_keys=True)
     row = conn.execute(
-        "SELECT response_json, fetched_at FROM api_cache WHERE cache_key = ?", (cache_key,)
+        "SELECT fetched_at FROM api_cache WHERE cache_key = ?", (cache_key,)
     ).fetchone()
     if row is not None:
         fetched_at = datetime.fromisoformat(row["fetched_at"])
         if datetime.now(timezone.utc) - fetched_at < timedelta(seconds=CACHE_TTL_SECONDS):
-            return json.loads(row["response_json"])
+            memo = _parsed.get(cache_key)
+            if memo is None or memo[0] != row["fetched_at"]:
+                response = conn.execute("SELECT response_json FROM api_cache WHERE cache_key = ?", (cache_key,)).fetchone()
+                memo = (row["fetched_at"], json.loads(response["response_json"]))
+                _parsed[cache_key] = memo
+            return memo[1]
 
     response = httpx.get(BASE_URL, params=FANTASYCALC_PARAMS, timeout=20.0)
     response.raise_for_status()

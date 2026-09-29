@@ -58,6 +58,16 @@ def league_settings(conn: sqlite3.Connection) -> tuple[int, dict]:
     return int(row["season"]), json.loads(row["settings_json"])
 
 
+def league_shape(conn: sqlite3.Connection, settings: dict | None = None) -> tuple[int, int]:
+    """(teams, rookie draft rounds) from the league's settings. A league
+    missing num_teams counts its rosters; missing draft_rounds falls back to
+    3, the only value this can't read elsewhere, and that one is stated."""
+    if settings is None:
+        _, settings = league_settings(conn)
+    teams = settings.get("num_teams") or conn.execute("SELECT count(*) FROM rosters").fetchone()[0] or 12
+    return teams, settings.get("draft_rounds") or 3
+
+
 def next_draft_season(conn: sqlite3.Connection) -> int:
     """The next rookie draft still to happen: a league draft Sleeper lists as
     not complete (a renewed league before its draft), else the season after
@@ -148,20 +158,18 @@ def parse_pick(spec: str, rounds: int | None = None, first_season: int | None = 
 def parse_league_pick(conn: sqlite3.Connection, spec: str) -> Pick:
     """parse_pick checked against this league: its draft rounds, its team
     count, and the drafts whose picks exist (the next PICK_SEASONS_AHEAD)."""
-    _, settings = league_settings(conn)
+    teams, rounds = league_shape(conn)
     first = next_draft_season(conn)
     return parse_pick(
-        spec, rounds=settings.get("draft_rounds") or 3, first_season=first,
-        last_season=first + PICK_SEASONS_AHEAD - 1, num_teams=settings.get("num_teams") or 12,
+        spec, rounds=rounds, first_season=first, last_season=first + PICK_SEASONS_AHEAD - 1, num_teams=teams,
     )
 
 
 def inventory(conn: sqlite3.Connection) -> list[dict]:
     """Every pick in the next PICK_SEASONS_AHEAD drafts: season, round, the
     roster it originally belonged to, and the roster that holds it now."""
-    _, settings = league_settings(conn)
+    _, rounds = league_shape(conn)
     first = next_draft_season(conn)
-    rounds = settings.get("draft_rounds") or 3
     roster_ids = [r[0] for r in conn.execute("SELECT roster_id FROM rosters ORDER BY roster_id")]
     traded = {
         (int(r["season"]), r["round"], r["roster_id"]): r["owner_id"]
@@ -249,11 +257,15 @@ def slot_history(conn: sqlite3.Connection, scoring_settings: dict, last_complete
     return history
 
 
-def comparable_rookie_value(conn: sqlite3.Connection, recent_class: int, overall_slot: int) -> tuple[float | None, list[str]]:
+def comparable_rookie_value(conn: sqlite3.Connection, recent_class: int, overall_slot: int,
+                            board: list[dict] | None = None) -> tuple[float | None, list[str]]:
     """FantasyCalc's current value for the rookies at overall_slot (pooled
     with the slots either side) in recent_class, ordered by the
-    draft-capital board. Returns (median value, their names)."""
-    board = prospect_model.post_draft_board(conn, recent_class)["rows"]
+    draft-capital board. Returns (median value, their names). board is
+    post_draft_board(conn, recent_class)["rows"] when the caller has it
+    already: building it runs the prospect model over the whole class."""
+    if board is None:
+        board = prospect_model.post_draft_board(conn, recent_class)["rows"]
     window = [r for i, r in enumerate(board, start=1) if abs(i - overall_slot) <= 1 and r["market_value"] is not None]
     if not window:
         return None, []
@@ -283,9 +295,9 @@ def projected_tier(conn: sqlite3.Connection, stats_season: int, my_roster_id: in
             if p["owner_roster_id"] == my_roster_id and (p["season"], p["round"]) == (pick.season, pick.round)]
     if len(held) != 1:
         return pick
-    _, settings = league_settings(conn)
+    teams, _ = league_shape(conn)
     slot = projected_order(conn, stats_season, my_roster_id)[held[0]["original_roster_id"]]["slot"]
-    return pick._replace(tier=tier_for_slot(slot, settings.get("num_teams") or 12), slot=slot)
+    return pick._replace(tier=tier_for_slot(slot, teams), slot=slot)
 
 
 def pick_report(conn: sqlite3.Connection, stats_season: int, my_roster_id: int, last_complete_season: int,
@@ -293,12 +305,12 @@ def pick_report(conn: sqlite3.Connection, stats_season: int, my_roster_id: int, 
     """Every pick (or only those roster_filter holds) with its projection,
     history, market price, comparable, and advice."""
     _, settings = league_settings(conn)
-    num_teams = settings.get("num_teams") or 12
-    rounds = settings.get("draft_rounds") or 3
+    num_teams, rounds = league_shape(conn, settings)
     next_draft = next_draft_season(conn)
     order = projected_order(conn, stats_season, my_roster_id)
     history = slot_history(conn, scoring_settings, last_complete_season, num_teams, rounds)
     recent_class = next_draft - 1  # the last class drafted, already valued by the market
+    board = prospect_model.post_draft_board(conn, recent_class)["rows"]  # once, not per pick
     rows = []
     for p in inventory(conn):
         if roster_filter is not None and p["owner_roster_id"] != roster_filter:
@@ -309,7 +321,7 @@ def pick_report(conn: sqlite3.Connection, stats_season: int, my_roster_id: int, 
             tier = tier_for_slot(slot, num_teams)
             overall = (p["round"] - 1) * num_teams + slot
             price = market.pick_market_value(conn, p["season"], p["round"], tier)
-            comparable, names = comparable_rookie_value(conn, recent_class, overall)
+            comparable, names = comparable_rookie_value(conn, recent_class, overall, board)
             call, ratio = advice(price, comparable)
             row.update({
                 "projected_slot": f"{p['round']}.{slot:02d}", "tier": tier, "overall": overall,

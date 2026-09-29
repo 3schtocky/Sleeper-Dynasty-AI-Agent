@@ -187,3 +187,38 @@ def test_the_cli_trade_default_discount_is_the_one_in_picks(monkeypatch):
     monkeypatch.setattr("sys.argv", ["dynasty-agent", "trade"])
     cli.main()
     assert seen["rate"] == picks.DISCOUNT_RATE == picks.valuation_discount_rate()
+
+
+# -- the pick report's cost and the league's shape ------------------------------------
+
+
+def test_league_shape_reads_settings_then_counts_rosters(conn):
+    assert picks.league_shape(conn) == (3, 2)  # the fixture's num_teams and draft_rounds
+    conn.execute("UPDATE league SET settings_json = '{}'")
+    assert picks.league_shape(conn) == (3, 3)  # 3 rosters in the table; rounds default to 3
+
+
+def test_pick_report_builds_the_draft_board_once(conn, monkeypatch):
+    calls = []
+    monkeypatch.setattr(valuation, "contend_or_rebuild", lambda conn, s, rid: {"league_win_now_totals": {1: 50.0, 2: 150.0, 3: 100.0}})
+    monkeypatch.setattr(picks, "slot_history", lambda *a: {})
+    monkeypatch.setattr(market, "fetch_values", lambda conn: [])
+    monkeypatch.setattr(picks.prospect_model, "post_draft_board", lambda conn, cls: calls.append(cls) or {"rows": []})
+    report = picks.pick_report(conn, 2026, 1, 2025, {}, None)
+    assert calls == [2026]  # one board for the whole report; it was one per next-draft pick
+    assert len([r for r in report["rows"] if r["season"] == 2027]) == 6
+
+
+def test_fantasycalc_response_is_parsed_once_until_it_is_refetched(conn, monkeypatch):
+    import json as json_module
+    from datetime import datetime, timezone
+
+    key = "fantasycalc:values/current:" + json_module.dumps(market.FANTASYCALC_PARAMS, sort_keys=True)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("INSERT INTO api_cache (cache_key, response_json, fetched_at) VALUES (?, '[{\"v\": 1}]', ?)", (key, now))
+    market._parsed.clear()
+    first = market.fetch_values(conn)
+    assert market.fetch_values(conn) is first  # same parsed list, no second json.loads
+    later = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE api_cache SET response_json = '[{\"v\": 2}]', fetched_at = ? WHERE cache_key = ?", (later, key))
+    assert market.fetch_values(conn) == [{"v": 2}]  # a refetch is seen at once
