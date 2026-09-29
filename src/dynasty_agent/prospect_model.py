@@ -215,10 +215,27 @@ VARIANTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # -- outcomes -----------------------------------------------------------------
 
 
+# first_three_season_ppg rescored ~140,000 player-weeks on every pick
+# report. Kept per (scoring, seasons, file versions): a changed scoring
+# setting or a re-downloaded file recomputes it.
+_ppg_memo: dict[tuple, dict[tuple[str, int], float]] = {}
+
+
 def first_three_season_ppg(scoring_settings: dict, seasons: range) -> dict[tuple[str, int], float]:
     """{(gsis_id, draft_class): points per game scheduled over that class's
     first three regular seasons}, from nflverse's stats_player_week files,
-    scored with this league's own scoring_settings."""
+    scored with this league's own scoring_settings. Callers must not mutate
+    the returned dict."""
+    paths = [nflverse.ensure_cached("stats_player_week", season) for season in seasons]
+    key = (json.dumps(scoring_settings, sort_keys=True), tuple(seasons),
+           tuple(path.stat().st_mtime_ns for path in paths))
+    if key not in _ppg_memo:
+        _ppg_memo.clear()  # only the latest is ever wanted; don't grow
+        _ppg_memo[key] = _first_three_season_ppg(scoring_settings, seasons)
+    return _ppg_memo[key]
+
+
+def _first_three_season_ppg(scoring_settings: dict, seasons: range) -> dict[tuple[str, int], float]:
     totals: dict[tuple[str, int], float] = {}
     con = duckdb.connect()
     try:

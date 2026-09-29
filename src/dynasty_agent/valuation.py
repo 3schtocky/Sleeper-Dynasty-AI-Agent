@@ -135,7 +135,33 @@ def team_situation_scores(season: int) -> dict[str, dict]:
     return result
 
 
+# player_valuations per season, reused while the same connection sees an
+# unchanged database: one chat question ran it two or three times (a trade
+# values the players, then the verdict, then the pick tiers, each from
+# scratch). total_changes moves with any write on this connection (a
+# refresh), PRAGMA data_version with any write from another one (the daily
+# launchd refresh). The memo holds the connection itself and compares by
+# identity: an id() key could be reused by a new connection once the old one
+# is gone, and sqlite connections can't be weakly referenced. Only the latest
+# entry per season is kept. Callers must not mutate the returned dict.
+_valuations_memo: dict[int, tuple[sqlite3.Connection, tuple[int, int], dict[str, dict]]] = {}
+
+
+def _db_version(conn: sqlite3.Connection) -> tuple[int, int]:
+    return conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0]
+
+
 def player_valuations(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
+    """player_valuations_uncached, reused while the database is unchanged."""
+    memo = _valuations_memo.get(season)
+    if memo is not None and memo[0] is conn and memo[1] == _db_version(conn):
+        return memo[2]
+    result = player_valuations_uncached(conn, season)
+    _valuations_memo[season] = (conn, _db_version(conn), result)
+    return result
+
+
+def player_valuations_uncached(conn: sqlite3.Connection, season: int) -> dict[str, dict]:
     """One valuation per player with a players-table entry and either real
     weekly_stats rows this season or last, or a prospect-model projection
     (a rookie, see prospect_model.rookie_projections): production score,
