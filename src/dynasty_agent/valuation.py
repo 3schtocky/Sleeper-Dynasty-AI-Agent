@@ -209,36 +209,55 @@ def blended_team_situations(season: int) -> dict[str, dict]:
     return blend.blended_situations(scores(season), scores(season - 1))
 
 
+# Verdict bands on the percentile against the other teams. Round, stated,
+# not fitted: this league has no history to fit them to yet.
+CONTEND_MIN_WIN_NOW_PCT = 60
+CONTEND_MIN_THREE_YEAR_PCT = 40
+REBUILD_MAX_WIN_NOW_PCT = 40
+REBUILD_MIN_THREE_YEAR_PCT = 55
+# Games played before results count as a real signal, roughly the week 6-7
+# decision point ahead of this league's week 9 trade deadline.
+SIGNAL_GAMES = 6
+
+
 def contend_or_rebuild(conn: sqlite3.Connection, season: int, my_roster_id: int) -> dict:
     """A verdict built from roster construction and compared against the
-    other eleven teams, not from record or points, those are only a real
-    signal once games have been played. Confidence is stated explicitly and
-    stays low until real in-season results accumulate.
+    other teams in the league, not from record or points, those are only a
+    real signal once games have been played. Confidence is stated explicitly
+    and stays low until real in-season results accumulate.
 
     Each team is scored on the best lineup it could start (starters and
     bench, per the league's own roster_positions), win-now and three-year
     each maximized separately. An earlier version summed whatever lineup
     each manager last set in Sleeper, empty or stale all offseason and
     wrong for any manager who hadn't set one, so the verdict measured
-    lineup-setting diligence as much as roster strength."""
+    lineup-setting diligence as much as roster strength.
 
-    valuations = player_valuations(conn, season)
+    verdict is "contend", "rebuild" or "unclear"; reason says why in words,
+    and label is how the CLI shows it. Percentiles rank my totals against
+    the other teams only: counting my own team capped the best roster at
+    the 96th percentile and floored the worst at the 4th."""
+    from dynasty_agent.errors import AgentError
+
+    roster_row = conn.execute(
+        "SELECT wins, losses, ties FROM rosters WHERE roster_id = ?", (my_roster_id,)
+    ).fetchone()
+    if roster_row is None:
+        raise AgentError(f"No roster {my_roster_id} in this league. Run `dynasty-agent refresh` first.")
 
     league_row = conn.execute("SELECT roster_positions_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
     if league_row is None:
-        raise ValueError("No league data cached yet. Run `dynasty-agent sync` first.")
+        raise ValueError("No league data cached yet. Run `dynasty-agent refresh` first.")
     slot_counts = starting_slot_counts(json.loads(league_row["roster_positions_json"]))
 
-    eligible = conn.execute(
-        "SELECT roster_id, player_id FROM roster_players WHERE slot IN ('starter', 'bench')"
-    ).fetchall()
-    team_win_now: dict[int, list[tuple[str | None, float]]] = {}
-    team_three_year: dict[int, list[tuple[str | None, float]]] = {}
-    for r in eligible:
-        team_win_now.setdefault(r["roster_id"], [])
-        team_three_year.setdefault(r["roster_id"], [])
+    valuations = player_valuations(conn, season)
+    team_win_now: dict[int, list[tuple[str | None, float]]] = {
+        r[0]: [] for r in conn.execute("SELECT roster_id FROM rosters")
+    }
+    team_three_year: dict[int, list[tuple[str | None, float]]] = {rid: [] for rid in team_win_now}
+    for r in conn.execute("SELECT roster_id, player_id FROM roster_players WHERE slot IN ('starter', 'bench')"):
         v = valuations.get(r["player_id"])
-        if v is None:
+        if v is None or r["roster_id"] not in team_win_now:
             continue
         team_win_now[r["roster_id"]].append((v["position"], v["win_now_value"]))
         team_three_year[r["roster_id"]].append((v["position"], v["three_year_value"]))
@@ -246,26 +265,29 @@ def contend_or_rebuild(conn: sqlite3.Connection, season: int, my_roster_id: int)
     win_now_totals = {rid: best_lineup_total(vals, slot_counts) for rid, vals in team_win_now.items()}
     three_year_totals = {rid: best_lineup_total(vals, slot_counts) for rid, vals in team_three_year.items()}
 
-    my_win_now = win_now_totals.get(my_roster_id, 0.0)
-    my_three_year = three_year_totals.get(my_roster_id, 0.0)
-    win_now_pct = percentile_rank(my_win_now, list(win_now_totals.values()))
-    three_year_pct = percentile_rank(my_three_year, list(three_year_totals.values()))
+    my_win_now = win_now_totals[my_roster_id]
+    my_three_year = three_year_totals[my_roster_id]
+    win_now_pct = percentile_rank(my_win_now, [v for rid, v in win_now_totals.items() if rid != my_roster_id])
+    three_year_pct = percentile_rank(my_three_year, [v for rid, v in three_year_totals.items() if rid != my_roster_id])
 
-    roster_row = conn.execute(
-        "SELECT wins, losses, ties FROM rosters WHERE roster_id = ?", (my_roster_id,)
-    ).fetchone()
-    played = ((roster_row["wins"] or 0) + (roster_row["losses"] or 0) + (roster_row["ties"] or 0)) if roster_row else 0
+    played = (roster_row["wins"] or 0) + (roster_row["losses"] or 0) + (roster_row["ties"] or 0)
 
-    if win_now_pct >= 60 and three_year_pct >= 40:
-        verdict = "contend"
-    elif win_now_pct < 40 and three_year_pct >= 55:
-        verdict = "rebuild"
+    if win_now_pct >= CONTEND_MIN_WIN_NOW_PCT and three_year_pct >= CONTEND_MIN_THREE_YEAR_PCT:
+        verdict, reason = "contend", (
+            f"win-now at or above the {CONTEND_MIN_WIN_NOW_PCT}th percentile and three-year value not in the "
+            f"bottom {CONTEND_MIN_THREE_YEAR_PCT}%"
+        )
+    elif win_now_pct < REBUILD_MAX_WIN_NOW_PCT and three_year_pct >= REBUILD_MIN_THREE_YEAR_PCT:
+        verdict, reason = "rebuild", (
+            f"win-now below the {REBUILD_MAX_WIN_NOW_PCT}th percentile with three-year value at or above the "
+            f"{REBUILD_MIN_THREE_YEAR_PCT}th"
+        )
     else:
-        verdict = "unclear: not a clean contender or a clean rebuild on roster construction alone"
+        verdict, reason = "unclear", "not a clean contender or a clean rebuild on roster construction alone"
 
     if played == 0:
         confidence = "low. 0 games played this season, this verdict is roster construction only, not results"
-    elif played < 6:
+    elif played < SIGNAL_GAMES:
         confidence = f"low to moderate. only {played} games played, recheck weekly through week 6 or 7"
     else:
         confidence = f"moderate to high. {played} games played, results are a real signal now"
@@ -273,14 +295,42 @@ def contend_or_rebuild(conn: sqlite3.Connection, season: int, my_roster_id: int)
     return {
         "season_used": season,
         "verdict": verdict,
+        "reason": reason,
+        "label": verdict.upper() + (f": {reason.upper()}" if verdict == "unclear" else ""),
         "confidence": confidence,
         "games_played": played,
         "my_win_now_total": my_win_now,
         "my_three_year_total": my_three_year,
         "win_now_percentile": win_now_pct,
         "three_year_percentile": three_year_pct,
+        "compared_against": len(win_now_totals) - 1,
         "league_win_now_totals": win_now_totals,
         "league_three_year_totals": three_year_totals,
+    }
+
+
+_SLOT_ORDER = {"starter": 0, "bench": 1, "taxi": 2, "reserve": 3}
+
+
+def my_team(conn: sqlite3.Connection, season: int, my_roster_id: int) -> dict:
+    """My roster, every player with a valuation (None for a player with no
+    games this season or last and no rookie projection), ordered starters,
+    bench, taxi, IR and by win-now value within each, plus the
+    contend-or-rebuild verdict. What `valuate` shows and the chat's my_team
+    tool answers from."""
+    valuations = player_valuations(conn, season)
+    rows = conn.execute(
+        "SELECT rp.player_id, rp.slot, p.full_name, p.position, p.age FROM roster_players rp "
+        "JOIN players p ON p.player_id = rp.player_id WHERE rp.roster_id = ?",
+        (my_roster_id,),
+    ).fetchall()
+    players = [{**dict(r), "valuation": valuations.get(r["player_id"])} for r in rows]
+    players.sort(key=lambda p: (_SLOT_ORDER.get(p["slot"], 9), -(p["valuation"] or {}).get("win_now_value", -1.0)))
+    return {
+        "season": season,
+        "players": players,
+        "has_rookie_projection": any((p["valuation"] or {}).get("value_source") == "prospect_model" for p in players),
+        "verdict": contend_or_rebuild(conn, season, my_roster_id),
     }
 
 
@@ -559,6 +609,7 @@ def evaluate_trade(
         "player_three_year_delta": player_three_year_delta,
         "market_value_delta": market_value_delta,
         "posture": posture,
+        "posture_label": verdict["label"],
         "posture_confidence": verdict["confidence"],
         "fit": fit,
         "consolidation": consolidation,

@@ -359,7 +359,7 @@ def cmd_picks(args: argparse.Namespace) -> None:
             print(f"  {r['season']} {r['projected_slot']}: {', '.join(r['comparable_players'])}")
     verdict = valuation.contend_or_rebuild(conn, stats_season, me)
     print(
-        f"\nYour posture: {verdict['verdict'].upper()} ({verdict['confidence']}). "
+        f"\nYour posture: {verdict['label']} ({verdict['confidence']}). "
         f"A contender sells picks for win-now help; a rebuilder holds or buys them."
     )
 
@@ -462,10 +462,9 @@ def cmd_valuate(args: argparse.Namespace) -> None:
     context.require_config()
     conn = get_db()
     me = context.my_roster_id(conn)
-
     season = context.stats_season(conn, args.season)
+    team = valuation.my_team(conn, season, me)
 
-    valuations = valuation.player_valuations(conn, season)
     print(_basis_line(season))
     print(
         "Situation score: average of QB passing EPA/game, team pass rate over expected, and sack rate "
@@ -473,27 +472,12 @@ def cmd_valuate(args: argparse.Namespace) -> None:
         "grade, real OL grades are paywalled; this is the public proxy.\n"
     )
 
-    my_players = conn.execute(
-        "SELECT rp.player_id, rp.slot, p.full_name, p.position, p.age FROM roster_players rp "
-        "JOIN players p ON p.player_id = rp.player_id WHERE rp.roster_id = ?",
-        (me,),
-    ).fetchall()
-
-    slot_order = {"starter": 0, "bench": 1, "taxi": 2, "reserve": 3}
-
-    def sort_key(row):
-        v = valuations.get(row["player_id"])
-        win_now = v["win_now_value"] if v else -1.0
-        return (slot_order.get(row["slot"], 9), -win_now)
-
-    my_players = sorted(my_players, key=sort_key)
-
     slot_labels = {"starter": "START", "bench": "BENCH", "taxi": "TAXI", "reserve": "IR"}
     header = f"{'Slot':<7} {'Player':<22} {'Pos':<4} {'Age':<4} {'FPPG':>6} {'Sit%':>6} {'WinNow':>8} {'3yr':>8}"
     print(header)
     print("-" * len(header))
-    for row in my_players:
-        v = valuations.get(row["player_id"])
+    for row in team["players"]:
+        v = row["valuation"]
         label = slot_labels.get(row["slot"], row["slot"])
         name = (row["full_name"] or "?")[:22]
         pos = row["position"] or ""
@@ -507,18 +491,18 @@ def cmd_valuate(args: argparse.Namespace) -> None:
             f"{v['win_now_value']:>8.1f} {v['three_year_value']:>8.1f}{_rookie_note(v)}"
         )
 
-    if any(valuations.get(r["player_id"], {}).get("value_source") == "prospect_model" for r in my_players):
+    if team["has_rookie_projection"]:
         print(_ROOKIE_FOOTNOTE)
 
-    verdict = valuation.contend_or_rebuild(conn, season, me)
+    verdict = team["verdict"]
     print()
-    print(f"Verdict: {verdict['verdict'].upper()}")
+    print(f"Verdict: {verdict['label']}")
     print(f"Confidence: {verdict['confidence']}")
     print(
         f"Inputs: win-now total {verdict['my_win_now_total']:.1f} "
-        f"({verdict['win_now_percentile']:.0f}th percentile of {len(verdict['league_win_now_totals'])} teams), "
+        f"({verdict['win_now_percentile']:.0f}th percentile against the other {verdict['compared_against']} teams), "
         f"three-year total {verdict['my_three_year_total']:.1f} "
-        f"({verdict['three_year_percentile']:.0f}th percentile of {len(verdict['league_three_year_totals'])} teams), "
+        f"({verdict['three_year_percentile']:.0f}th percentile against the other {verdict['compared_against']} teams), "
         f"{verdict['games_played']} games played this season."
     )
 
@@ -631,7 +615,7 @@ def cmd_trade(args: argparse.Namespace) -> None:
     print(f"Net win-now (players only): {result['win_now_delta']:+.1f}")
     print(f"Net 3yr, mine (players only): {result['player_three_year_delta']:+.1f}")
     print(f"Net market value (players + picks): {result['market_value_delta']:+.0f}")
-    print(f"Your posture: {result['posture'].upper()} ({result['posture_confidence']})")
+    print(f"Your posture: {result['posture_label']} ({result['posture_confidence']})")
     print(f"Fit: {result['fit']}")
     if result["consolidation"]:
         print(f"Note: {result['consolidation']}")
