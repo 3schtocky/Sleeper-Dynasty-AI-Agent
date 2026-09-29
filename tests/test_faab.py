@@ -1,12 +1,11 @@
 """Waiver targets and FAAB bids: ranked by how much a player would raise my
 best lineup, bids scaled by that gain, paced over the weeks that matter."""
 
-import json
 
 import pytest
 
 from dynasty_agent import weekly
-from tests.test_integration import LINEUP, add_league, add_player, add_roster, conn  # noqa: F401 (conn is a fixture)
+from tests.test_integration import add_league, add_player, add_roster
 
 
 def league(conn, week=4, settings=None, season_type="regular"):

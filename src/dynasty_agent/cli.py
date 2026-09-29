@@ -45,7 +45,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"'{args.username}' is in {len(leagues)} {season} leagues:\n")
         for league in leagues:
             print(f"  {league['league_id']}  {league['name']}")
-        print(f"\nRe-run with --league-id <id> to pick one.")
+        print("\nRe-run with --league-id <id> to pick one.")
         raise SystemExit(1)
 
     # encoding explicit: Path.write_text() otherwise falls back to the OS

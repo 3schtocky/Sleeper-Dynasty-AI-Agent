@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from dynasty_agent import weekly
-from tests.test_integration import LINEUP, add_league, add_player, add_roster, conn  # noqa: F401 (conn is a fixture)
+from tests.test_integration import add_league, add_player, add_roster
 
 
 @pytest.fixture

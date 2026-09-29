@@ -17,16 +17,6 @@ from dynasty_agent.db import apply_migrations
 LINEUP = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX"] + ["BN"] * 10 + ["TAXI"] * 3 + ["IR"]
 
 
-@pytest.fixture
-def conn(monkeypatch):
-    c = sqlite3.connect(":memory:")
-    c.row_factory = sqlite3.Row
-    apply_migrations(c, MIGRATIONS_DIR)
-    # Situation scores read nflverse parquet files; every team neutral here.
-    monkeypatch.setattr(valuation, "team_situation_scores", lambda season: {})
-    return c
-
-
 def add_league(conn, settings=None):
     conn.execute(
         "INSERT INTO league (league_id, season, scoring_settings_json, roster_positions_json, settings_json, fetched_at) "

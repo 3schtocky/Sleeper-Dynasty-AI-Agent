@@ -5,7 +5,7 @@ import pytest
 
 from dynasty_agent import valuation
 from dynasty_agent.errors import AgentError
-from tests.test_integration import add_league, add_player, add_roster, conn  # noqa: F401 (conn is a fixture)
+from tests.test_integration import add_league, add_player, add_roster
 
 
 def league_of(conn, monkeypatch, teams: dict[int, tuple[float, float]]):
