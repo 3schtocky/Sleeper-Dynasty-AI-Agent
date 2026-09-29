@@ -527,6 +527,21 @@ def cmd_chat(args: argparse.Namespace) -> None:
     chat.run(get_db(), do_refresh=not args.no_refresh)
 
 
+def cmd_chat_eval(args: argparse.Namespace) -> None:
+    from dynasty_agent import chat_eval, llm
+
+    with llm.OllamaClient(model=args.model or llm.LLM_MODEL) as client:
+        client.ensure_ready()
+        client.warm()
+        report = chat_eval.run_live(client, record=args.record)
+    for r in report["results"]:
+        print(f"  {'ok  ' if r['ok'] else 'FAIL'} {r['seconds']:>5.2f}s  [{r['kind']}] {r['question']}"
+              + (f"\n         {r['why']}" if r["why"] else ""))
+    print(f"\n{report['model']}: {report['passed']} of {report['total']} routed correctly, {report['seconds']}s.")
+    if args.record:
+        print(f"Recorded to {chat_eval.RECORDING.relative_to(config.PROJECT_ROOT)}; tests/test_chat_routing.py replays it.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="dynasty-agent", description="Dynasty fantasy football agent for a Sleeper league."
@@ -742,6 +757,14 @@ def main() -> None:
         help="Skip the session-start refresh (quicker restarts; the data may be stale).",
     )
     chat_parser.set_defaults(func=cmd_chat)
+
+    eval_parser = sub.add_parser(
+        "chat-eval",
+        help="[Phase 5] Score the local model's routing on the chat's real questions, including trade direction.",
+    )
+    eval_parser.add_argument("--model", default=None, help="An Ollama model to score instead of LLM_MODEL.")
+    eval_parser.add_argument("--record", action="store_true", help="Save the answers for the offline routing test.")
+    eval_parser.set_defaults(func=cmd_chat_eval)
 
     args = parser.parse_args()
     try:

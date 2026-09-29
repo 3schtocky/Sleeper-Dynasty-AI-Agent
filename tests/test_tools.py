@@ -95,3 +95,29 @@ def test_a_hint_in_parentheses_settles_which_player(league):
         assert r.clarification is None and r.compact["user_receives"][0].startswith("Kenneth Walker"), name
     r = tools.run_tool(league, "evaluate_trade", {"receive_players": ["Kenneth Walker (QB)"], "send_players": ["Jonah Coleman"]})
     assert r.clarification.startswith("Which Kenneth Walker")  # a hint that fits neither still asks
+
+
+def test_a_trade_read_backwards_is_turned_around_by_the_rosters(league):
+    # "Would you trade my 2027 1st for Puka Nacua?" read as sending Puka.
+    r = tools.run_tool(league, "evaluate_trade", {"send_players": ["Puka Nacua"], "receive_picks": ["2027 1st"]})
+    assert r.compact["user_sends"][0].startswith("2027 1.")  # the user's own pick, so its projected slot is known
+    assert r.compact["user_receives"][0].startswith("Puka Nacua")
+    assert r.compact["warnings"][0] == "Puka Nacua is on another team's roster, so it's evaluated as a player you receive."
+    assert "WARNING: Puka Nacua is on another team's roster" in r.numbers
+
+
+def test_both_assets_put_on_one_side_are_split_by_the_rosters(league):
+    # "A guy offered me his 2028 1st for Jonah Coleman" read as receiving both.
+    r = tools.run_tool(league, "evaluate_trade", {"receive_players": ["Jonah Coleman"], "receive_picks": ["2028 1st"]})
+    assert [x.split(" (")[0] for x in r.compact["user_sends"]] == ["Jonah Coleman"]
+    assert [x.split(" (")[0] for x in r.compact["user_receives"]] == ["2028 round 1"]
+
+
+def test_a_free_agent_is_never_moved_only_warned_about(league):
+    r = tools.run_tool(league, "evaluate_trade", {"send_players": ["Jonah Coleman"], "receive_players": ["Player fa"]})
+    assert r.compact["user_receives"][0].startswith("Player fa")
+    assert not any("so it's evaluated" in w for w in r.compact["warnings"])
+
+
+def test_none_in_an_optional_argument_means_blank(league):
+    assert tools.run_tool(league, "waiver_targets", {"player": "none", "position": "null"}).numbers.startswith("FAAB targets")

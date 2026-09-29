@@ -32,11 +32,13 @@ def _tool(name: str, description: str, properties: dict | None = None) -> dict:
 
 
 TOOLS = [
-    _tool("set_lineup", "The user's best starting lineup for this week against their real opponent, with win probability."),
+    _tool("set_lineup", "Who the user should start and sit this week: the best lineup against their real opponent, "
+                        "with win probability."),
     _tool(
         "evaluate_trade",
-        "Evaluate a trade. send = what the USER gives away; receive = what the USER gets. "
-        "\"I'm offered X for Y\" means the user receives X and sends Y.",
+        "Evaluate a trade. send = what the USER gives away; receive = what the USER gets. \"my X\" is sent; "
+        "\"his X\", \"their X\" or \"a 2028 1st\" offered to the user is received. \"I'm offered X for Y\" means the "
+        "user receives X and sends Y.",
         {
             "send_players": {**_LIST, "description": "Players the user gives away."},
             "send_picks": {**_LIST, "description": "Draft picks the user gives away, e.g. '2027 1st'."},
@@ -120,6 +122,12 @@ def _pin(conn: sqlite3.Connection, name: str) -> str:
         return base
 
 
+def _blank_if_none(value) -> str:
+    """A model sometimes fills an optional argument with "none" or "null"."""
+    text = str(value or "").strip()
+    return "" if text.lower() in ("none", "null", "n/a", "na", "any", "all") else text
+
+
 def _clarify(e: ValueError) -> str:
     if isinstance(e, AmbiguousPlayer):
         options = [f"{c['full_name']} ({c['position']} {c['team'] or 'FA'})" for c in e.candidates]
@@ -193,6 +201,9 @@ def _evaluate_trade(conn, me, season, args) -> ToolResult:
         return ToolResult("evaluate_trade", clarification="What would you send and what would you get back?")
     send_players = [_pin(conn, n) for n in send_players]
     receive_players = [_pin(conn, n) for n in receive_players]
+    send_players, receive_players, send_specs, receive_specs, side_notes = fix_sides(
+        conn, me, send_players, receive_players, send_specs, receive_specs
+    )
     send_picks = [picks.parse_league_pick(conn, s) for s in send_specs]
     receive_picks = [picks.parse_league_pick(conn, s) for s in receive_specs]
     r = valuation.evaluate_trade(conn, season, me, send_players, send_picks, receive_players, receive_picks,
@@ -205,6 +216,7 @@ def _evaluate_trade(conn, me, season, args) -> ToolResult:
             f"{pk['label']} (value {pk['model_value']:.0f})" if pk["model_value"] is not None else f"{pk['label']} (no price)"
             for pk in s["picks"]]
 
+    r["warnings"][:0] = side_notes
     compact = {
         "user_sends": side(r["sent"]),
         "user_receives": side(r["received"]),
@@ -217,6 +229,48 @@ def _evaluate_trade(conn, me, season, args) -> ToolResult:
         "units": "market values are FantasyCalc trade-value points, not dollars; win-now is points per game",
     }
     return ToolResult("evaluate_trade", formatters.format_trade(r, season), compact)
+
+
+def fix_sides(conn, me: int, send: list[str], receive: list[str], send_picks: list[str],
+              receive_picks: list[str]) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+    """Put players the model placed on the wrong side of a trade where the
+    rosters prove they belong: a player the user would "receive" who is on
+    the user's roster is sent, and a player the user would "send" who is on
+    another team's roster is received. If that leaves one side empty while
+    the other still holds picks, the picks are what the user gives or gets
+    for the players, so they move across too. A free agent or an unknown
+    name is never moved. Returns the four lists and a note per move.
+
+    The Phase 5 chat-eval caught the model reversing "a guy offered me his
+    2028 1st for Rome Odunze" and "my 2027 round 1 pick for Trey Benson",
+    the one failure this tool must not have."""
+    owner = {r[0]: r[1] for r in conn.execute("SELECT player_id, roster_id FROM roster_players")}
+
+    def pid(name: str) -> str | None:
+        try:
+            return valuation.resolve_player(conn, name)["player_id"]
+        except ValueError:
+            return None
+
+    notes = []
+    new_send = [n for n in send if not (pid(n) in owner and owner[pid(n)] != me)]
+    new_receive = [n for n in receive if not (pid(n) in owner and owner[pid(n)] == me)]
+    moved_in = [n for n in send if n not in new_send]
+    moved_out = [n for n in receive if n not in new_receive]
+    new_send += moved_out
+    new_receive += moved_in
+    for n in moved_out:
+        notes.append(f"{valuation.resolve_player(conn, n)['full_name']} is on your roster, so it's evaluated as a player you send.")
+    for n in moved_in:
+        notes.append(f"{valuation.resolve_player(conn, n)['full_name']} is on another team's roster, so it's evaluated as a player you receive.")
+    if moved_in or moved_out:
+        if not new_send and not send_picks and receive_picks and new_receive:
+            send_picks, receive_picks = receive_picks, []
+            notes.append("The picks named are evaluated as what you give for those players.")
+        elif not new_receive and not receive_picks and send_picks and new_send:
+            receive_picks, send_picks = send_picks, []
+            notes.append("The picks named are evaluated as what you get for those players.")
+    return new_send, new_receive, send_picks, receive_picks, notes
 
 
 def _my_team(conn, me, season, args) -> ToolResult:
@@ -238,7 +292,7 @@ def _my_team(conn, me, season, args) -> ToolResult:
 
 
 def _waiver_targets(conn, me, season, args) -> ToolResult:
-    player = (args.get("player") or "").strip()
+    player = _blank_if_none(args.get("player"))
     if player:
         player = _pin(conn, player)
         r = weekly.faab_recommendation(conn, season, me, player)
@@ -251,7 +305,7 @@ def _waiver_targets(conn, me, season, args) -> ToolResult:
             "note": r["note"],
         }
         return ToolResult("waiver_targets", formatters.format_faab(r), compact)
-    position = (args.get("position") or "").strip().upper() or None
+    position = _blank_if_none(args.get("position")).upper() or None
     if position not in (None, "QB", "RB", "WR", "TE"):
         position = None
     targets = weekly.top_faab_targets(conn, season, me, position=position)
