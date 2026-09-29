@@ -374,12 +374,18 @@ def cmd_taxi(args: argparse.Namespace) -> None:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
     st = result["settings"]
-    deadline = f"taxi deadline week {st['taxi_deadline']}" if st["taxi_deadline"] else "no taxi deadline (moves allowed all season)"
+    deadline = (
+        f"taxi deadline {st['taxi_deadline']} (read as week {st['taxi_deadline']}; Sleeper doesn't document the field)"
+        if st["taxi_deadline"] else "no taxi deadline (moves allowed all season)"
+    )
     eligible = "rookies or veterans" if st["taxi_allow_vets"] else "rookies only"
+    ir_word = "IR slot" if st["reserve_slots"] == 1 else "IR slots"
     print(
         f"Taxi and IR plan. Your league: {st['taxi_slots']} taxi slots, {eligible}, {st['taxi_years']} year max, "
-        f"{deadline}; {st['reserve_slots']} IR slot. Taxi players can't be started.\n"
+        f"{deadline}; {st['reserve_slots']} {ir_word}. Taxi players can't be started.\n"
     )
+    if result["taxi_locked"]:
+        print(f"Taxi moves are locked: it's week {result['current_week']}, past the deadline. IR moves still work.\n")
     print(
         f"Active roster: {result['active_count']} of {result['active_capacity']}. "
         f"Taxi: {len(result['taxi_now'])} of {st['taxi_slots']} used. IR: {len(result['ir_now'])} of {st['reserve_slots']} used."
@@ -399,13 +405,15 @@ def cmd_taxi(args: argparse.Namespace) -> None:
         print(f"  Keep {p['full_name']} active: taxi-eligible, but he's in your best lineup right now.")
 
     print(f"\nNext season ({result['next_draft']} rookie draft):")
+    graduating = ", ".join(p["full_name"] for p in result["graduating"])
     print(
-        f"  You hold {result['next_picks']} picks in that draft. Today's taxi players graduate back to the active roster; "
-        f"the new rookies can take the taxi slots. Projected: {result['roster_next']} players for {result['capacity_next']} spots."
+        f"  You hold {result['next_picks']} picks in that draft. Taxi players, after the moves above, graduate back to "
+        f"the active roster{f' ({graduating})' if graduating else ''}; the new rookies can take the taxi slots. "
+        f"Projected: {result['roster_next']} players for {result['capacity_next']} spots."
     )
     if result["overflow"] > 0:
         if result["cut_candidates"]:
-            print(f"  Roster crunch: {result['overflow']} cut(s) needed. Lowest three-year value among non-rookie non-starters:")
+            print(f"  Roster crunch: {result['overflow']} cut(s) needed. Lowest three-year value among veterans who don't start over a season:")
             for p in result["cut_candidates"]:
                 print(f"    {p['full_name']:<22} {p['position']:<3} 3yr value {p['three_year_value']:.1f}")
         else:

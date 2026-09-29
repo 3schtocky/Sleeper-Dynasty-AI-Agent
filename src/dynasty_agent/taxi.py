@@ -71,6 +71,15 @@ def _best_lineup_ids(players: list[dict], slot_counts: dict[str, int]) -> set[st
     return starters
 
 
+def taxi_locked(settings: dict, current_week: int | None) -> bool:
+    """Whether the league's taxi deadline has passed. Sleeper's taxi_deadline
+    is 0 for no deadline; a nonzero value is read here as the week taxi moves
+    stop, an interpretation the CLI states rather than hides (Sleeper
+    doesn't document the field, and this league's is 0)."""
+    deadline = settings.get("taxi_deadline") or 0
+    return bool(deadline) and current_week is not None and current_week >= deadline
+
+
 def plan(conn: sqlite3.Connection, stats_season: int, my_roster_id: int) -> dict:
     league = conn.execute("SELECT season, settings_json, roster_positions_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
     if league is None:
@@ -107,6 +116,10 @@ def plan(conn: sqlite3.Connection, stats_season: int, my_roster_id: int) -> dict
     taxi_now = [p for p in roster if p["slot"] == "taxi"]
     ir_now = [p for p in roster if p["slot"] == "reserve"]
 
+    state = conn.execute("SELECT week FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    current_week = state["week"] if state else None
+    locked = taxi_locked(settings, current_week)
+
     moves = []
     # IR first: any IR-eligible active player outside the best lineup, most
     # valuable first (he's the one worth keeping rather than cutting).
@@ -115,13 +128,14 @@ def plan(conn: sqlite3.Connection, stats_season: int, my_roster_id: int) -> dict
         if ir_open <= 0:
             break
         if p["player_id"] not in starters and ir_eligible(p["injury_status"], settings):
-            moves.append({"player": p, "to": "IR", "why": f"designated {p['injury_status']}, the IR slot is open"})
+            slot_word = "the IR slot is" if reserve_slots == 1 else "an IR slot is"
+            moves.append({"player": p, "to": "IR", "why": f"designated {p['injury_status']}, {slot_word} open"})
             ir_open -= 1
     moved = {m["player"]["player_id"] for m in moves}
 
     # Taxi: eligible active players outside the best lineup, the most
     # long-term value first (the stash worth protecting).
-    taxi_open = taxi_slots - len(taxi_now)
+    taxi_open = 0 if locked else taxi_slots - len(taxi_now)
     for p in sorted(active, key=lambda p: -p["three_year_value"]):
         if taxi_open <= 0:
             break
@@ -135,11 +149,13 @@ def plan(conn: sqlite3.Connection, stats_season: int, my_roster_id: int) -> dict
     # Next season's crunch: every rostered player carries over, current
     # taxi players graduate back to the active roster (taxi_years), and the
     # next draft's rookies can fill the taxi slots first.
-    league_season = int(league["season"])
+    next_draft = picks.next_draft_season(conn)
     next_picks = [
         p for p in picks.inventory(conn)
-        if p["season"] == league_season + 1 and p["owner_roster_id"] == my_roster_id
+        if p["season"] == next_draft and p["owner_roster_id"] == my_roster_id
     ]
+    # Who leaves taxi for the active roster next season: today's taxi
+    # players past taxi_years, plus the rookies moved there now.
     graduating = [p for p in taxi_now if (p["years_exp"] or 0) + 1 >= (settings.get("taxi_years") or 1)]
     graduating += [m["player"] for m in moves if m["to"] == "taxi"]
     # IR isn't counted as next-season room: it's temporary, and a player
@@ -147,8 +163,11 @@ def plan(conn: sqlite3.Connection, stats_season: int, my_roster_id: int) -> dict
     total_next = len(roster) + len(next_picks)
     capacity_next = active_capacity + min(len(next_picks), taxi_slots)
     overflow = total_next - capacity_next
+    # A cut candidate is judged on the season, not this week: an injured
+    # starter is out of this week's lineup but is no one to cut.
+    season_starters = _best_lineup_ids(active + ir_now, slot_counts)
     cut_candidates = sorted(
-        (p for p in roster if p["player_id"] not in starters and (p["years_exp"] or 0) > 0),
+        (p for p in roster if p["player_id"] not in season_starters and (p["years_exp"] or 0) > 0),
         key=lambda p: p["three_year_value"],
     )[: max(overflow, 0)]
 
@@ -157,9 +176,10 @@ def plan(conn: sqlite3.Connection, stats_season: int, my_roster_id: int) -> dict
             "taxi_slots": taxi_slots, "taxi_years": settings.get("taxi_years"), "taxi_allow_vets": bool(settings.get("taxi_allow_vets")),
             "taxi_deadline": settings.get("taxi_deadline"), "reserve_slots": reserve_slots,
         },
+        "current_week": current_week, "taxi_locked": locked,
         "active_count": len(active), "active_capacity": active_capacity,
         "taxi_now": taxi_now, "ir_now": ir_now, "moves": moves, "keep_active": keep_active,
         "bench_spots_freed": len(moves),
-        "next_draft": league_season + 1, "next_picks": len(next_picks), "graduating": graduating,
+        "next_draft": next_draft, "next_picks": len(next_picks), "graduating": graduating,
         "roster_next": total_next, "capacity_next": capacity_next, "overflow": overflow, "cut_candidates": cut_candidates,
     }
