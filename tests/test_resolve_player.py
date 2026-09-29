@@ -65,7 +65,14 @@ def test_a_name_prefers_the_player_who_can_play_in_this_league(conn):
     assert resolve_player(conn, "Justin Jefferson")["player_id"] == "6794"
     assert resolve_player(conn, "d.j. moore")["player_id"] == "4983"  # not the retired CB
     assert resolve_player(conn, "Josh Allen")["player_id"] == "4984"  # not the guard
-    assert resolve_player(conn, "Kenneth Walker III")["player_id"] == "8151"  # not the teamless WR
+
+
+def test_a_teamless_player_at_a_startable_position_still_makes_it_a_question(conn):
+    # The teamless WR could be a free agent who signed since the last sync;
+    # choosing the KC RB silently would size a FAAB bid on the wrong player.
+    with pytest.raises(AmbiguousPlayer) as err:
+        resolve_player(conn, "Kenneth Walker III")
+    assert [c["player_id"] for c in err.value.candidates] == ["8151", "4634"]  # the one with a team first
 
 
 def test_an_idp_league_asks_which_justin_jefferson(conn):
@@ -101,9 +108,11 @@ def test_two_equally_relevant_players_are_a_question_not_a_guess(conn):
     assert "id 4068" in str(err.value) and "id 748" in str(err.value)
 
 
-def test_rostered_player_counts_as_relevant_without_an_nfl_team(conn):
+def test_a_rostered_player_is_listed_first_not_chosen(conn):
     conn.execute("INSERT INTO roster_players (roster_id, player_id, slot, fetched_at) VALUES (1, '748', 'bench', 't')")
-    assert resolve_player(conn, "Mike Williams")["player_id"] == "748"
+    with pytest.raises(AmbiguousPlayer) as err:
+        resolve_player(conn, "Mike Williams")
+    assert err.value.candidates[0]["player_id"] == "748"
 
 
 def test_no_match_and_empty_input_are_clear_errors(conn):

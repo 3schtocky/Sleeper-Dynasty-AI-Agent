@@ -345,12 +345,14 @@ def resolve_player(conn: sqlite3.Connection, name_or_id: str) -> dict:
     the players table. Raises PlayerNotFound or AmbiguousPlayer (both
     ValueErrors) rather than silently guessing which player was meant.
 
-    Names compare after normalize_name. Among several matches, the ones who
-    matter to this league win: a position one of its starting slots takes,
-    and either an NFL team or a spot on a league roster. "Justin Jefferson"
-    is the Vikings WR in a league with no IDP, not the Browns LB; two
-    matches that both matter still come back as a question. A full-name
-    match is tried before a partial one ("Jefferson" alone asks which)."""
+    Names compare after normalize_name. Among several matches, a player
+    whose position none of this league's starting slots takes is dropped:
+    "Justin Jefferson" is the Vikings WR in a league with no IDP, not the
+    Browns LB. Any two matches at startable positions come back as a
+    question, rostered and NFL-team players listed first, even when one has
+    no team: that can be a free agent who signed since the last sync. A
+    full-name match is tried before a partial one ("Jefferson" alone asks
+    which)."""
     query = (name_or_id or "").strip()
     if not query:
         raise PlayerNotFound("No player name given.")
@@ -365,15 +367,15 @@ def resolve_player(conn: sqlite3.Connection, name_or_id: str) -> dict:
     rostered = {r[0] for r in conn.execute("SELECT player_id FROM roster_players")}
     players = [dict(r) for r in conn.execute("SELECT * FROM players WHERE full_name IS NOT NULL")]
 
-    def matters(p: dict) -> bool:
-        return p["position"] in positions and (p["team"] is not None or p["player_id"] in rostered)
-
     def pick(matches: list[dict]) -> dict | None:
-        relevant = [p for p in matches if matters(p)] or matches
+        # Only a position this league can't start rules a player out. No NFL
+        # team or roster spot is not enough: a street free agent who just
+        # signed still shows no team until the next sync.
+        relevant = [p for p in matches if p["position"] in positions] or matches
         if len(relevant) == 1:
             return relevant[0]
         if relevant:
-            relevant.sort(key=lambda p: (p["player_id"] not in rostered, p["full_name"]))
+            relevant.sort(key=lambda p: (p["player_id"] not in rostered, p["team"] is None, p["full_name"]))
             raise AmbiguousPlayer(
                 query,
                 [{k: p[k] for k in ("player_id", "full_name", "position", "team", "years_exp")} for p in relevant[:10]],
