@@ -394,7 +394,8 @@ def resolve_player(conn: sqlite3.Connection, name_or_id: str) -> dict:
     return found
 
 
-def pick_value_estimate(conn: sqlite3.Connection, season: int, round_num: int, discount_rate: float) -> dict:
+def pick_value_estimate(conn: sqlite3.Connection, season: int, round_num: int, discount_rate: float,
+                        tier: str | None = None) -> dict:
     """My model's value for a future pick: FantasyCalc's real, current
     market price for the nearest season it prices in this round (the base
     season), discounted forward by discount_rate per year of distance from
@@ -403,28 +404,30 @@ def pick_value_estimate(conn: sqlite3.Connection, season: int, round_num: int, d
     further out than FantasyCalc prices get a model value but no arbitrage
     figure, there is nothing to compare against. A pick for a season before
     the base season (a draft that already happened) gets no model value:
-    that pick no longer exists to trade."""
+    that pick no longer exists to trade.
+
+    With a tier, the price is FantasyCalc's tiered one ("2027 1st (Early)")
+    where it prices tiers, the same price the pick report uses, and
+    price_label says which price was used."""
     priced = market.priced_pick_seasons(conn, round_num)
     base_season = priced[0] if priced else None
-    this_pick_market_value = market.pick_market_value(conn, season, round_num)
+    this_pick_market_value, price_label = market.pick_price(conn, season, round_num, tier)
+    common = {"season": season, "round": round_num, "tier": tier, "base_season": base_season,
+              "market_value": this_pick_market_value, "price_label": price_label}
 
     if base_season is None or season < base_season:
-        return {
-            "season": season, "round": round_num, "base_season": base_season, "model_value": None,
-            "market_value": this_pick_market_value, "arbitrage": None,
-        }
+        return {**common, "model_value": None, "arbitrage": None}
 
-    base_value = market.pick_market_value(conn, base_season, round_num)
-    model_value = discounted_pick_value(base_value, season - base_season, discount_rate)
-    arbitrage = (model_value - this_pick_market_value) if this_pick_market_value is not None else None
-    return {
-        "season": season, "round": round_num, "base_season": base_season, "model_value": model_value,
-        "market_value": this_pick_market_value, "arbitrage": arbitrage,
-    }
+    # The base season's own price is this pick's price (tiered if it has a
+    # tier); a later season discounts forward from the untiered base price.
+    base_value = this_pick_market_value if season == base_season else market.pick_market_value(conn, base_season, round_num)
+    model_value = discounted_pick_value(base_value, season - base_season, discount_rate) if base_value is not None else None
+    arbitrage = (model_value - this_pick_market_value) if this_pick_market_value is not None and model_value is not None else None
+    return {**common, "model_value": model_value, "arbitrage": arbitrage}
 
 
 def _value_trade_side(
-    conn: sqlite3.Connection, valuations: dict, players_in: list[dict], picks_in: list[tuple[int, int]], discount_rate: float
+    conn: sqlite3.Connection, valuations: dict, players_in: list[dict], picks_in: list, discount_rate: float
 ) -> dict:
     """One side of a trade, players and picks valued and totaled.
 
@@ -458,9 +461,13 @@ def _value_trade_side(
         )
 
     pick_rows = []
-    for pick_season, pick_round in picks_in:
-        estimate = pick_value_estimate(conn, pick_season, pick_round, discount_rate)
-        pick_rows.append({**estimate, "label": f"{pick_season} round {pick_round}"})
+    for pick in picks_in:
+        season, rnd, tier, slot = (tuple(pick) + (None, None))[:4]  # a picks.Pick or a plain (season, round)
+        estimate = pick_value_estimate(conn, season, rnd, discount_rate, tier)
+        label = f"{season} round {rnd}"
+        if slot is not None:
+            label = f"{season} {rnd}.{slot:02d}"
+        pick_rows.append({**estimate, "slot": slot, "label": label})
 
     win_now_total = sum(r["win_now_value"] for r in player_rows)  # players only, always unit-safe
     player_three_year_total = sum(r["three_year_value"] for r in player_rows)  # players only, my model, informative
@@ -503,6 +510,13 @@ def evaluate_trade(
     send_resolved = [resolve_player(conn, n) for n in send_players]
     receive_resolved = [resolve_player(conn, n) for n in receive_players]
     valuations = player_valuations(conn, valuation_season)
+    # A pick the user sends is priced at its projected tier when which pick
+    # it is isn't in doubt (see picks.projected_tier); a pick received from
+    # an unnamed team keeps the untiered price unless the user gave a tier
+    # or slot. Imported here: picks imports this module.
+    from dynasty_agent import picks as picks_module
+
+    send_picks = [picks_module.projected_tier(conn, valuation_season, my_roster_id, picks_module.Pick(*p)) for p in send_picks]
 
     sent = _value_trade_side(conn, valuations, send_resolved, send_picks, discount_rate)
     received = _value_trade_side(conn, valuations, receive_resolved, receive_picks, discount_rate)

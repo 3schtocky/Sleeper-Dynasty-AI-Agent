@@ -31,8 +31,10 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import statistics
+from typing import NamedTuple
 
 from dynasty_agent import market, prospect_model, valuation
 from dynasty_agent.metrics import percentile_rank, production_score
@@ -56,10 +58,109 @@ def league_settings(conn: sqlite3.Connection) -> tuple[int, dict]:
     return int(row["season"]), json.loads(row["settings_json"])
 
 
+def next_draft_season(conn: sqlite3.Connection) -> int:
+    """The next rookie draft still to happen: a league draft Sleeper lists as
+    not complete (a renewed league before its draft), else the season after
+    the league's own. Sleeper doesn't always list past drafts (this league's
+    table is empty), so an absent draft means "after the league season"."""
+    league_season, _ = league_settings(conn)
+    row = conn.execute(
+        "SELECT min(CAST(season AS INTEGER)) FROM drafts WHERE status != 'complete' AND CAST(season AS INTEGER) >= ?",
+        (league_season,),
+    ).fetchone()
+    return row[0] if row and row[0] is not None else league_season + 1
+
+
+class Pick(NamedTuple):
+    """A rookie pick as a person names it. tier ("Early"/"Mid"/"Late") and
+    slot (1.05 -> 5) are None unless given or projected."""
+
+    season: int
+    round: int
+    tier: str | None = None
+    slot: int | None = None
+
+
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
+_TIER_WORDS = {"early": "Early", "mid": "Mid", "middle": "Mid", "late": "Late"}
+_PICK_FORMAT_HINT = "Write it like '2027 1st', '2027-1' or '2027 1.05'."
+
+
+def parse_pick(spec: str, rounds: int | None = None, first_season: int | None = None,
+               last_season: int | None = None, num_teams: int = 12) -> Pick:
+    """Read a pick the way people write it: '2027-1', '2027 1st', '2027 round
+    1', "'27 first", '2027-1st', '2027 early 1st', '2027 1.05'. A slot sets
+    the tier. Raises ValueError, saying what's wrong, on anything it can't
+    read or a round or season outside the given bounds. "next year's 1st"
+    means the first_season draft when bounds are given."""
+    text = (spec or "").lower().replace("’", "'")
+    text = re.sub(r"[-_/,()]", " ", text)
+
+    tier = None
+    for word, label in _TIER_WORDS.items():
+        if re.search(rf"\b{word}\b", text):
+            tier = label
+            text = re.sub(rf"\b{word}\b", " ", text)
+
+    season = None
+    # "next year's first": the next draft, known only with the league's bounds.
+    relative = re.search(r"\b(?:next (?:year|season|draft)|upcoming|this coming)\b", text)
+    if relative and first_season is not None:
+        season = first_season
+        text = text[: relative.start()] + " " + text[relative.end():]
+    for pattern, offset in ((r"\b(20\d\d)\b", 0), (r"'(\d\d)\b", 2000), (r"(?<![.\d])\b(\d\d)\b(?![.\d])", 2000)):
+        if season is not None:
+            break
+        m = re.search(pattern, text)
+        if m:
+            season = int(m.group(1)) + offset
+            text = text[: m.start()] + " " + text[m.end():]
+            break
+
+    rnd = slot = None
+    m = re.search(r"\b(\d)\.(\d{1,2})\b", text)
+    if m:
+        rnd, slot = int(m.group(1)), int(m.group(2))
+    else:
+        for pattern in (r"\b(\d)(?:st|nd|rd|th)\b", r"\b(?:round|rd|r)\s*(\d)\b", r"\b(\d)\b"):
+            m = re.search(pattern, text)
+            if m:
+                rnd = int(m.group(1))
+                break
+        if rnd is None:
+            rnd = next((n for word, n in _ORDINALS.items() if re.search(rf"\b{word}\b", text)), None)
+
+    if season is None or rnd is None:
+        raise ValueError(f"Couldn't read '{spec}' as a draft pick. {_PICK_FORMAT_HINT}")
+    if rounds is not None and not 1 <= rnd <= rounds:
+        raise ValueError(f"'{spec}': this league's rookie draft has {rounds} rounds, there's no round {rnd}.")
+    if first_season is not None and season < first_season:
+        raise ValueError(f"'{spec}': the {season} rookie draft already happened, the next one is {first_season}.")
+    if last_season is not None and season > last_season:
+        raise ValueError(f"'{spec}': picks can be valued through the {last_season} draft, not {season}.")
+    if slot is not None:
+        if not 1 <= slot <= num_teams:
+            raise ValueError(f"'{spec}': a {num_teams}-team league has picks {rnd}.01 through {rnd}.{num_teams:02d}.")
+        tier = tier_for_slot(slot, num_teams)
+    return Pick(season, rnd, tier, slot)
+
+
+def parse_league_pick(conn: sqlite3.Connection, spec: str) -> Pick:
+    """parse_pick checked against this league: its draft rounds, its team
+    count, and the drafts whose picks exist (the next PICK_SEASONS_AHEAD)."""
+    _, settings = league_settings(conn)
+    first = next_draft_season(conn)
+    return parse_pick(
+        spec, rounds=settings.get("draft_rounds") or 3, first_season=first,
+        last_season=first + PICK_SEASONS_AHEAD - 1, num_teams=settings.get("num_teams") or 12,
+    )
+
+
 def inventory(conn: sqlite3.Connection) -> list[dict]:
     """Every pick in the next PICK_SEASONS_AHEAD drafts: season, round, the
     roster it originally belonged to, and the roster that holds it now."""
-    league_season, settings = league_settings(conn)
+    _, settings = league_settings(conn)
+    first = next_draft_season(conn)
     rounds = settings.get("draft_rounds") or 3
     roster_ids = [r[0] for r in conn.execute("SELECT roster_id FROM rosters ORDER BY roster_id")]
     traded = {
@@ -67,7 +168,7 @@ def inventory(conn: sqlite3.Connection) -> list[dict]:
         for r in conn.execute("SELECT season, round, roster_id, owner_id FROM traded_picks")
     }
     picks = []
-    for season in range(league_season + 1, league_season + 1 + PICK_SEASONS_AHEAD):
+    for season in range(first, first + PICK_SEASONS_AHEAD):
         for rnd in range(1, rounds + 1):
             for original in roster_ids:
                 picks.append({
@@ -104,23 +205,6 @@ def projected_order(conn: sqlite3.Connection, stats_season: int, my_roster_id: i
 def tier_for_slot(slot: int, num_teams: int) -> str:
     size = num_teams / len(TIER_LABELS)
     return TIER_LABELS[min(int((slot - 1) // size), len(TIER_LABELS) - 1)]
-
-
-def _round_label(rnd: int) -> str:
-    return {1: "1st", 2: "2nd", 3: "3rd"}.get(rnd, f"{rnd}th")
-
-
-def fantasycalc_pick_price(conn: sqlite3.Connection, season: int, rnd: int, tier: str | None) -> float | None:
-    """FantasyCalc's price for "<season> <round>" or its "(Early/Mid/Late)"
-    tier when one is given and priced; falls back to the untiered price."""
-    label = f"{season} {_round_label(rnd)}"
-    wanted = [f"{label} ({tier})", label] if tier else [label]
-    prices = {}
-    for entry in market.fetch_values(conn):
-        player = entry.get("player") or {}
-        if player.get("position") == "PICK" and player.get("name") in wanted:
-            prices[player["name"]] = entry.get("value")
-    return next((prices[w] for w in wanted if w in prices), None)
 
 
 def slot_history(conn: sqlite3.Connection, scoring_settings: dict, last_complete_season: int, num_teams: int, rounds: int) -> dict[int, dict]:
@@ -187,17 +271,34 @@ def advice(pick_price: float | None, comparable: float | None) -> tuple[str, flo
     return "HOLD", ratio
 
 
+def projected_tier(conn: sqlite3.Connection, stats_season: int, my_roster_id: int, pick: Pick) -> Pick:
+    """The tier of a pick the user holds, when that's knowable: a pick in the
+    next draft, no tier given, and exactly one pick of that season and round
+    held (so which team's pick it is isn't in doubt). The tier comes from the
+    original team's projected slot, as in pick_report. Otherwise the pick
+    comes back unchanged and gets FantasyCalc's untiered price."""
+    if pick.tier is not None or pick.season != next_draft_season(conn):
+        return pick
+    held = [p for p in inventory(conn)
+            if p["owner_roster_id"] == my_roster_id and (p["season"], p["round"]) == (pick.season, pick.round)]
+    if len(held) != 1:
+        return pick
+    _, settings = league_settings(conn)
+    slot = projected_order(conn, stats_season, my_roster_id)[held[0]["original_roster_id"]]["slot"]
+    return pick._replace(tier=tier_for_slot(slot, settings.get("num_teams") or 12), slot=slot)
+
+
 def pick_report(conn: sqlite3.Connection, stats_season: int, my_roster_id: int, last_complete_season: int,
                 scoring_settings: dict, roster_filter: int | None) -> dict:
     """Every pick (or only those roster_filter holds) with its projection,
     history, market price, comparable, and advice."""
-    league_season, settings = league_settings(conn)
+    _, settings = league_settings(conn)
     num_teams = settings.get("num_teams") or 12
     rounds = settings.get("draft_rounds") or 3
-    next_draft = league_season + 1
+    next_draft = next_draft_season(conn)
     order = projected_order(conn, stats_season, my_roster_id)
     history = slot_history(conn, scoring_settings, last_complete_season, num_teams, rounds)
-    recent_class = league_season  # the class drafted before the current league season, already valued by the market
+    recent_class = next_draft - 1  # the last class drafted, already valued by the market
     rows = []
     for p in inventory(conn):
         if roster_filter is not None and p["owner_roster_id"] != roster_filter:
@@ -207,7 +308,7 @@ def pick_report(conn: sqlite3.Connection, stats_season: int, my_roster_id: int, 
             slot = order[p["original_roster_id"]]["slot"]
             tier = tier_for_slot(slot, num_teams)
             overall = (p["round"] - 1) * num_teams + slot
-            price = fantasycalc_pick_price(conn, p["season"], p["round"], tier)
+            price = market.pick_market_value(conn, p["season"], p["round"], tier)
             comparable, names = comparable_rookie_value(conn, recent_class, overall)
             call, ratio = advice(price, comparable)
             row.update({
@@ -242,6 +343,11 @@ def _round_history(history: dict[int, dict], rnd: int, num_teams: int) -> dict |
     }
 
 
+DISCOUNT_RATE = 0.20
+
+
 def valuation_discount_rate() -> float:
-    """The trade evaluator's default future-pick discount, one place."""
-    return 0.20
+    """The default future-pick discount per year, the one place it's set:
+    the trade evaluator, the CLI's --discount-rate default and the pick
+    report all read it here."""
+    return DISCOUNT_RATE

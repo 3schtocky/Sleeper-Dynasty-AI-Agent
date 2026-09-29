@@ -553,15 +553,14 @@ def _rookie_note(v: dict) -> str:
     return f"  * rookie, projected from pick {v['draft_pick']}{games}"
 
 
-def _parse_pick(spec: str) -> tuple[int, int]:
-    """Parse 'SEASON-ROUND', e.g. '2027-1', into (season, round)."""
-    parts = spec.split("-")
-    if len(parts) != 2:
-        raise ValueError(f"pick must look like '2027-1' (season-round), got '{spec}'")
-    try:
-        return int(parts[0]), int(parts[1])
-    except ValueError:
-        raise ValueError(f"pick must look like '2027-1' (season-round), got '{spec}'")
+def _pick_price_note(pick: dict) -> str:
+    """Which FantasyCalc price a traded pick got, when it matters: a next-draft
+    pick's price swings with its tier (2027 1st: Early 4608, Late 2313)."""
+    if pick["tier"] and pick["price_label"] and "(" in pick["price_label"]:
+        return f"  priced as {pick['price_label']}"
+    if pick["tier"] is None and pick["price_label"] and pick["season"] == pick["base_season"]:
+        return "  tier unknown, FantasyCalc's average; name a tier or slot (e.g. '2027 early 1st', '2027 1.03')"
+    return ""
 
 
 def cmd_trade(args: argparse.Namespace) -> None:
@@ -572,8 +571,8 @@ def cmd_trade(args: argparse.Namespace) -> None:
     season = context.stats_season(conn, args.season)
 
     try:
-        send_picks = [_parse_pick(p) for p in (args.send_pick or [])]
-        receive_picks = [_parse_pick(p) for p in (args.receive_pick or [])]
+        send_picks = [picks.parse_league_pick(conn, p) for p in (args.send_pick or [])]
+        receive_picks = [picks.parse_league_pick(conn, p) for p in (args.receive_pick or [])]
         result = valuation.evaluate_trade(
             conn,
             season,
@@ -606,7 +605,7 @@ def cmd_trade(args: argparse.Namespace) -> None:
             arb_str = f"{pk['arbitrage']:+.0f}" if pk["arbitrage"] is not None else "-"
             print(
                 f"  {pk['label']:<22} {'PICK':<4} "
-                f"model {model_str:>6}  market {market_str:>6}  arbitrage {arb_str:>7}"
+                f"model {model_str:>6}  market {market_str:>6}  arbitrage {arb_str:>7}{_pick_price_note(pk)}"
             )
         print(
             f"  totals: win-now (players only) {side['win_now_total']:.1f}, "
@@ -963,17 +962,20 @@ def main() -> None:
     )
     trade_parser.add_argument("--send", action="append", metavar="PLAYER", help="A player you would send. Repeatable.")
     trade_parser.add_argument(
-        "--send-pick", action="append", metavar="SEASON-ROUND", help="A pick you would send, e.g. 2027-1. Repeatable."
+        "--send-pick", action="append", metavar="PICK",
+        help="A pick you would send: 2027-1, '2027 1st', '2027 early 1st' or '2027 1.05'. Repeatable."
     )
     trade_parser.add_argument(
         "--receive", action="append", metavar="PLAYER", help="A player you would receive. Repeatable."
     )
     trade_parser.add_argument(
-        "--receive-pick", action="append", metavar="SEASON-ROUND", help="A pick you would receive, e.g. 2027-1. Repeatable."
+        "--receive-pick", action="append", metavar="PICK",
+        help="A pick you would receive, written like --send-pick. Name a tier or slot for a tiered price. Repeatable."
     )
     trade_parser.add_argument(
-        "--discount-rate", type=float, default=0.20,
-        help="Per-year discount applied to future pick values beyond the base season (default 0.20 = 20%% per year).",
+        "--discount-rate", type=float, default=picks.valuation_discount_rate(),
+        help=f"Per-year discount applied to future pick values beyond the base season "
+        f"(default {picks.valuation_discount_rate():.2f}, set in picks.py).",
     )
     trade_parser.add_argument(
         "--season", type=int, default=None, help="Valuation basis season. Defaults to the most recently ingested season."
