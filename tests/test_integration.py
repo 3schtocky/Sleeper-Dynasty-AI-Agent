@@ -120,7 +120,7 @@ def test_pick_for_an_already_held_draft_gets_no_model_value(conn, monkeypatch):
 def test_trade_side_names_unpriced_assets_instead_of_a_silent_zero(conn, monkeypatch):
     monkeypatch.setattr(market, "fetch_values", lambda conn: fake_pick_values({"2028 1st": 2000}))
     add_player(conn, "p1", "WR", 12.0)
-    side = valuation._value_trade_side(conn, {}, ["p1"], [(2027, 1)], discount_rate=0.2)
+    side = valuation._value_trade_side(conn, {}, [valuation.resolve_player(conn, "p1")], [(2027, 1)], discount_rate=0.2)
     assert side["unpriced"] == ["Player p1", "2027 round 1"]
 
 

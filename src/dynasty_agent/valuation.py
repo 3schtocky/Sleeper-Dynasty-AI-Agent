@@ -284,32 +284,112 @@ def contend_or_rebuild(conn: sqlite3.Connection, season: int, my_roster_id: int)
     }
 
 
+class PlayerNotFound(ValueError):
+    """No player matches the name given."""
+
+
+class AmbiguousPlayer(ValueError):
+    """More than one player matches. candidates lists them (player_id,
+    full_name, position, team, years_exp) so a caller can ask which one was meant
+    instead of guessing."""
+
+    def __init__(self, query: str, candidates: list[dict]):
+        self.query = query
+        self.candidates = candidates
+        labels = [f"{c['full_name']} ({c['position']} {c['team'] or 'FA'}" for c in candidates]
+        # Two teamless "Mike Williams (WR FA)" read the same; tell them apart.
+        labels = [
+            label + (f", {c['years_exp']} yrs exp, id {c['player_id']})" if labels.count(label) > 1 else ")")
+            for label, c in zip(labels, candidates)
+        ]
+        names = ", ".join(labels)
+        super().__init__(f"'{query}' matches more than one player: {names}. Be more specific or use the player_id.")
+
+
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+# Which players.position values can fill each Sleeper starting slot. A
+# player whose position fills none of this league's slots (an LB in a league
+# with no IDP) can't matter to it, so a name lookup prefers the ones who can.
+_SLOT_POSITIONS = {
+    "FLEX": {"RB", "WR", "TE"},
+    "WRRB_FLEX": {"RB", "WR"},
+    "REC_FLEX": {"WR", "TE"},
+    "SUPER_FLEX": {"QB", "RB", "WR", "TE"},
+    "IDP_FLEX": {"DL", "LB", "DB", "DE", "DT", "CB", "S", "SS", "FS", "OLB", "ILB"},
+    "DL": {"DL", "DE", "DT"},
+    "DB": {"DB", "CB", "S", "SS", "FS"},
+    "LB": {"LB", "OLB", "ILB"},
+}
+
+
+def normalize_name(name: str) -> str:
+    """Lowercase, punctuation and suffixes dropped: "Ja'Marr Chase" and
+    "Jamarr Chase" match, as do "D.J. Moore" and "DJ Moore", and "Marvin
+    Harrison Jr." matches Sleeper's "Marvin Harrison"."""
+    cleaned = "".join(ch if ch.isalnum() or ch.isspace() else ("" if ch in ".'’" else " ") for ch in name.lower())
+    return " ".join(t for t in cleaned.split() if t not in _NAME_SUFFIXES)
+
+
+def _league_positions(conn: sqlite3.Connection) -> set[str]:
+    row = conn.execute("SELECT roster_positions_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    slots = json.loads(row["roster_positions_json"]) if row and row["roster_positions_json"] else ["QB", "RB", "WR", "TE"]
+    positions: set[str] = set()
+    for slot in slots:
+        positions |= _SLOT_POSITIONS.get(slot, {slot})
+    return positions
+
+
 def resolve_player(conn: sqlite3.Connection, name_or_id: str) -> dict:
     """Resolve a player name or a literal Sleeper player_id to a row from
-    the players table. Raises ValueError, listing candidates, on no match
-    or an ambiguous one, rather than silently guessing which player was
-    meant."""
-    row = conn.execute("SELECT * FROM players WHERE player_id = ?", (name_or_id,)).fetchone()
+    the players table. Raises PlayerNotFound or AmbiguousPlayer (both
+    ValueErrors) rather than silently guessing which player was meant.
+
+    Names compare after normalize_name. Among several matches, the ones who
+    matter to this league win: a position one of its starting slots takes,
+    and either an NFL team or a spot on a league roster. "Justin Jefferson"
+    is the Vikings WR in a league with no IDP, not the Browns LB; two
+    matches that both matter still come back as a question. A full-name
+    match is tried before a partial one ("Jefferson" alone asks which)."""
+    query = (name_or_id or "").strip()
+    if not query:
+        raise PlayerNotFound("No player name given.")
+    row = conn.execute("SELECT * FROM players WHERE player_id = ?", (query,)).fetchone()
     if row is not None:
         return dict(row)
+    wanted = normalize_name(query)
+    if not wanted:
+        raise PlayerNotFound(f"No player found matching '{query}'.")
 
-    exact = conn.execute("SELECT * FROM players WHERE lower(full_name) = lower(?)", (name_or_id,)).fetchall()
-    if len(exact) == 1:
-        return dict(exact[0])
-    if len(exact) > 1:
-        names = ", ".join(f"{r['full_name']} ({r['position']} {r['team']})" for r in exact)
-        raise ValueError(f"'{name_or_id}' matches more than one player: {names}. Use the player_id instead.")
+    positions = _league_positions(conn)
+    rostered = {r[0] for r in conn.execute("SELECT player_id FROM roster_players")}
+    players = [dict(r) for r in conn.execute("SELECT * FROM players WHERE full_name IS NOT NULL")]
 
-    fuzzy = conn.execute(
-        "SELECT * FROM players WHERE full_name LIKE ? ORDER BY full_name", (f"%{name_or_id}%",)
-    ).fetchall()
-    if len(fuzzy) == 1:
-        return dict(fuzzy[0])
-    if len(fuzzy) > 1:
-        names = ", ".join(f"{r['full_name']} ({r['position']} {r['team']})" for r in fuzzy[:10])
-        raise ValueError(f"'{name_or_id}' is ambiguous, matches: {names}. Be more specific or use the player_id.")
+    def matters(p: dict) -> bool:
+        return p["position"] in positions and (p["team"] is not None or p["player_id"] in rostered)
 
-    raise ValueError(f"No player found matching '{name_or_id}'.")
+    def pick(matches: list[dict]) -> dict | None:
+        relevant = [p for p in matches if matters(p)] or matches
+        if len(relevant) == 1:
+            return relevant[0]
+        if relevant:
+            relevant.sort(key=lambda p: (p["player_id"] not in rostered, p["full_name"]))
+            raise AmbiguousPlayer(
+                query,
+                [{k: p[k] for k in ("player_id", "full_name", "position", "team", "years_exp")} for p in relevant[:10]],
+            )
+        return None
+
+    exact = [p for p in players if normalize_name(p["full_name"]) == wanted]
+    found = pick(exact)
+    if found is None:
+        padded = f" {wanted} "
+        found = pick([p for p in players if padded in f" {normalize_name(p['full_name'])} "])
+    if found is None:
+        found = pick([p for p in players if wanted in normalize_name(p["full_name"])])
+    if found is None:
+        raise PlayerNotFound(f"No player found matching '{query}'.")
+    return found
 
 
 def pick_value_estimate(conn: sqlite3.Connection, season: int, round_num: int, discount_rate: float) -> dict:
@@ -342,7 +422,7 @@ def pick_value_estimate(conn: sqlite3.Connection, season: int, round_num: int, d
 
 
 def _value_trade_side(
-    conn: sqlite3.Connection, valuations: dict, players_in: list[str], picks_in: list[tuple[int, int]], discount_rate: float
+    conn: sqlite3.Connection, valuations: dict, players_in: list[dict], picks_in: list[tuple[int, int]], discount_rate: float
 ) -> dict:
     """One side of a trade, players and picks valued and totaled.
 
@@ -358,8 +438,7 @@ def _value_trade_side(
     model value, both already in FantasyCalc's scale.
     """
     player_rows = []
-    for name_or_id in players_in:
-        p = resolve_player(conn, name_or_id)
+    for p in players_in:
         v = valuations.get(p["player_id"])
         player_rows.append(
             {
@@ -415,11 +494,16 @@ def evaluate_trade(
     """Both sides of a proposed trade, valued on win-now and three-year
     axes, picks discounted and checked against FantasyCalc for arbitrage,
     and flagged for fit against the current contend-or-rebuild posture and
-    for consolidation (many pieces for one, or the reverse)."""
+    for consolidation (many pieces for one, or the reverse).
+
+    Names resolve before anything is valued, so a typo or an ambiguous name
+    fails in milliseconds instead of after a full valuation pass."""
+    send_resolved = [resolve_player(conn, n) for n in send_players]
+    receive_resolved = [resolve_player(conn, n) for n in receive_players]
     valuations = player_valuations(conn, valuation_season)
 
-    sent = _value_trade_side(conn, valuations, send_players, send_picks, discount_rate)
-    received = _value_trade_side(conn, valuations, receive_players, receive_picks, discount_rate)
+    sent = _value_trade_side(conn, valuations, send_resolved, send_picks, discount_rate)
+    received = _value_trade_side(conn, valuations, receive_resolved, receive_picks, discount_rate)
 
     win_now_delta = received["win_now_total"] - sent["win_now_total"]
     player_three_year_delta = received["player_three_year_total"] - sent["player_three_year_total"]
