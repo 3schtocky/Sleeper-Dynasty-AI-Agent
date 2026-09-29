@@ -151,7 +151,7 @@ What keeps it honest:
 - **Trade sides are checked against the rosters.** If the model puts a player you own on the side you'd receive, the evaluation moves them and says so.
 - **It can't change your roster.** Sleeper's API is read-only: make every move in the Sleeper app.
 
-Ask how it works and it shows the calculation with your own numbers, then explains it in plain language: "How did you get Trey Benson's win-now value?", "Why is his 3yr lower?", "What does situation score mean?", "Why does age matter for running backs?". The steps come from the same constants that produce the number and are checked against it before they are shown, so the model can retell them but not invent them. Follow-ups like "why?" refer to the last answer.
+Ask how it works and it shows the calculation with your own numbers, then explains it in plain language: "How did you get Trey Benson's win-now value?", "Why is his 3yr lower?", "What does situation score mean?", "Why does age matter for running backs?". The steps come from the same constants that produce the number and are checked against it before they are shown, so the model can retell them but not invent them. It works for a player's value, a trade ("why?" after the answer), the lineup's win probability, a FAAB bid, the contend or rebuild call, and a buy, hold or sell on a pick. Follow-ups like "why?" refer to the last answer.
 
 Commands inside the chat: `/raw` shows what the model was given for the last answer, `/stats off` hides the stats line, `/help`, `/quit`. `--no-refresh` skips the start-up refresh for a quick restart.
 

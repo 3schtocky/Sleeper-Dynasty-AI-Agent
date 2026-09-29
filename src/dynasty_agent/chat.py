@@ -62,6 +62,8 @@ HELP = """Ask in plain English, for example:
   Should I sell my first?  Anyone I should put on taxi?
 Ask how it works, too:
   How did you get Trey Benson's win-now value?     Why is his 3yr lower?     What is situation score?
+  Why? (after a trade)     How is that win probability calculated?     How did you size that bid?
+  How did you decide I'm a contender?     Why is that a sell?
 Commands:
   /raw          what the model was given for the last answer (tool, arguments, summary)
   /stats off    hide the stats line (/stats on to show it)

@@ -192,3 +192,174 @@ def test_find_player_reads_the_name_out_of_the_question_possessives_included(con
     assert explain.find_player(conn, 2025, "How did you get Trey Benson's win-now value?") == "Trey Benson"
     assert explain.find_player(conn, 2025, "trey benson jr smith?") == "Trey Benson Jr Smith"  # the longest name wins
     assert explain.find_player(conn, 2025, "what does arbitrage mean") is None
+
+
+# -- phase B: lineups and trades --------------------------------------------------------
+
+
+def lineup_result(prob=None, opponent=True):
+    def p(name, mean, variance, **kw):
+        return {"full_name": name, "mean": mean, "variance": variance, "injury_status": None, "vegas_multiplier": 1.0,
+                "on_bye": False, "variance_estimated": False, **kw}
+
+    starters = [p("Amon-Ra", 14.0, 30.0), p("Rice", 10.0, 25.0, injury_status="Questionable", vegas_multiplier=1.1),
+                p("Rookie", 5.0, 20.0, variance_estimated=True)]
+    mean_me, var_me = 29.0, 75.0
+    result = {"week": 4, "recommended_lineup": starters, "opponent_mean": None, "opponent_variance": None,
+              "opponent_note": "no matchup set for this week yet", "opponent_source": None, "opponent_roster_id": None,
+              "recommended_win_probability": None, "differs_from_points_max": False, "swaps_from_points_max": [],
+              "points_max_total": None}
+    if opponent:
+        result.update(opponent_mean=25.0, opponent_variance=60.0, opponent_source="their set lineup", opponent_roster_id=7,
+                      opponent_note=None,
+                      recommended_win_probability=prob if prob is not None else
+                      metrics.matchup_win_probability(mean_me - 25.0, (var_me + 60.0) ** 0.5))
+    return result
+
+
+def test_the_win_probability_is_recomputed_from_the_gap_and_spread_shown():
+    r = lineup_result()
+    e = explain.explain_lineup(r)
+    labels = [s.label for s in e.steps]
+    assert labels == ["Your projected points, week 4", "Adjustments this week", "Your spread (variance)",
+                      "Opponent (roster 7)", "The gap", "Win probability"]
+    assert e.steps[0].value == "29.0" and e.steps[2].value == "75.0"
+    assert e.steps[4].value == "+4.0" and "sqrt(75.0 + 60.0) = 11.6" in e.steps[4].why
+    assert e.steps[-1].value == f"{r['recommended_win_probability']:.1%}"
+    assert "Rice: Questionable x0.85, Vegas x1.10" in e.steps[1].formula
+    assert "Rookie" in e.steps[2].why  # a borrowed variance is disclosed
+    assert any("draft heuristic" in line and "independent" in line for line in e.limits)
+
+
+def test_a_win_probability_that_does_not_reproduce_is_never_explained():
+    with pytest.raises(explain.ExplanationMismatch, match="win probability"):
+        explain.explain_lineup(lineup_result(prob=0.5))
+
+
+def test_no_opponent_means_no_win_probability_and_says_why():
+    e = explain.explain_lineup(lineup_result(opponent=False))
+    assert e.steps[-1].label == "Opponent" and "no win probability" in e.steps[-1].why
+
+
+def test_the_swap_from_the_points_lineup_is_explained():
+    r = lineup_result()
+    r.update(differs_from_points_max=True, points_max_total=30.5, swaps_from_points_max=[{"starts": "A", "slot": "FLEX", "over": "B"}])
+    last = explain.explain_lineup(r).steps[-1]
+    assert last.formula == "A over B" and last.value == "30.5 pts for the alternative"
+
+
+@pytest.fixture
+def trade(conn, monkeypatch):
+    from tests.test_integration import trade_league
+
+    trade_league(conn, monkeypatch)
+    return lambda **kw: valuation.evaluate_trade(
+        conn, 2025, 1, kw.get("send", []), kw.get("send_picks", []), kw.get("receive", []), kw.get("receive_picks", []), 0.2)
+
+
+def test_a_trade_explanation_reproduces_every_total_and_discounts_a_later_pick(conn, trade):
+    r = trade(send=["mine"], receive=["theirs"], receive_picks=[(2028, 1)])
+    e = explain.explain_trade(conn, r)
+    by_label = {s.label: s for s in e.steps}
+    pick = by_label["Pick price: 2028 round 1"]
+    assert "(1 - 20%)^1" in pick.formula and pick.value == f"{r['received']['picks'][0]['model_value']:.0f}"
+    assert by_label["Net market value"].value == f"{r['market_value_delta']:+.0f}"
+    assert by_label["Market value you receive"].value == f"{r['received']['market_value_total']:.0f}"
+    assert by_label["Net win-now (players only)"].value == f"{r['win_now_delta']:+.1f}"
+    assert by_label["Fit with your posture"].value == r["fit"]
+    assert any("not dollars" in line for line in e.limits)
+
+
+def test_a_trade_total_that_does_not_reproduce_is_never_explained(conn, trade):
+    r = trade(send=["mine"], receive=["theirs"])
+    r["received"]["market_value_total"] += 50
+    with pytest.raises(explain.ExplanationMismatch, match="market value you receive"):
+        explain.explain_trade(conn, r)
+
+
+def test_an_unpriced_asset_is_named_as_counting_zero(conn, trade):
+    conn.execute("DELETE FROM market_values WHERE player_id = 'fa'")
+    r = trade(send=["mine"], receive=["fa"])
+    assert r["received"]["unpriced"] == ["Player fa"]
+    assert any("counts as 0" in line and "Player fa" in line for line in explain.explain_trade(conn, r).limits)
+
+
+# -- phase C: bids, the verdict and picks -------------------------------------------------
+
+
+def bid(**kw):
+    base = {"player": "Trey Benson", "player_id": "tb", "remaining_budget": 100, "weeks_left": 5, "phase": "regular",
+            "base_per_week_budget": 20.0, "lineup_gain": 3.0, "best_available_gain": 3.0, "value_multiplier": 3.0,
+            "suggested_bid": 60, "budget_is_default": False, "note": None}
+    return {**base, **kw}
+
+
+def test_a_bid_is_rebuilt_from_pace_gain_and_multiplier():
+    e = explain.explain_faab(bid())
+    assert [s.value for s in e.steps] == ["$20.00 a week", "+3.0", "3.00", "$60"]
+    assert e.subject == {"player_id": "tb", "full_name": "Trey Benson"}
+
+
+def test_a_player_who_would_not_start_gets_the_token_bid_and_says_so():
+    e = explain.explain_faab(bid(lineup_gain=0.0, value_multiplier=0.2, suggested_bid=4))
+    assert e.steps[1].value == "none" and "wouldn't start" in e.steps[1].why and e.steps[-1].value == "$4"
+
+
+def test_a_bid_that_does_not_reproduce_is_never_explained():
+    with pytest.raises(explain.ExplanationMismatch, match="suggested bid"):
+        explain.explain_faab(bid(suggested_bid=61))
+
+
+def test_the_verdict_is_ranked_against_the_other_teams_and_reproduced(conn, monkeypatch):
+    from tests.test_my_team import league_of
+
+    league_of(conn, monkeypatch, {1: (30, 30), 2: (20, 20), 3: (10, 10)})
+    e = explain.explain_verdict(conn, 2025, 1)
+    assert e.steps[0].value == "100th percentile" and "you beat 2 of 2" in e.steps[0].why
+    assert e.steps[2].value == "CONTEND"
+    assert any("other 2 teams only" in line for line in e.limits)
+
+
+def pick_row(**kw):
+    return {"season": 2027, "round": 1, "projected_slot": "1.05", "tier": "Mid", "fantasycalc_price": 3034.0,
+            "comparable_value": 2500.0, "comparable_players": ["A", "B"], "advice": "SELL", **kw}
+
+
+def test_a_pick_call_is_the_price_over_what_the_slot_bought_against_the_bands():
+    e = explain.explain_pick(pick_row())
+    assert e.steps[-2].value == "1.21" and e.steps[-1].value == "SELL" and "1.15" in e.steps[-2].why
+
+
+def test_a_pick_call_that_does_not_reproduce_is_never_explained():
+    with pytest.raises(explain.ExplanationMismatch, match="pick call"):
+        explain.explain_pick(pick_row(advice="BUY"))
+
+
+@pytest.mark.parametrize("question", [
+    "How did you size that bid?",
+    "Why did you bench Rashee Rice?",
+    "How did you decide I should rebuild?",
+    "Why is the verdict rebuild?",
+    "How is that win probability calculated?",
+    "Why is the net market value so high?",
+    "How did you price my 2027 1st?",
+])
+def test_phase_b_and_c_questions_are_recognized(question):
+    assert explain.detect(question, has_recent=True), question
+
+
+@pytest.mark.parametrize("n, text", [(1, "1st"), (2, "2nd"), (3, "3rd"), (4, "4th"), (11, "11th"), (12, "12th"), (13, "13th"),
+                                     (21, "21st"), (36, "36th"), (82, "82nd"), (83, "83rd"), (100, "100th"), (101, "101st")])
+def test_ordinals_read_like_a_person_wrote_them(n, text):
+    assert explain.ordinal(n) == text
+
+
+def test_the_bid_step_shows_the_unrounded_product_so_the_model_never_has_to_work_it_out():
+    step = explain.explain_faab(bid(remaining_budget=100, weeks_left=11, base_per_week_budget=100 / 11, lineup_gain=0.0,
+                                    value_multiplier=0.2, suggested_bid=2)).steps[-1]
+    assert step.formula == "$9.09 x 0.20 = $1.82, rounded to whole dollars and capped at what is left" and step.value == "$2"
+
+
+@pytest.mark.parametrize("question", ["Why is that a sell?", "Why is that a buy?", "Why is it a hold?"])
+def test_why_is_that_a_sell_is_an_explain_question_after_an_answer(question):
+    assert explain.detect(question, has_recent=True)

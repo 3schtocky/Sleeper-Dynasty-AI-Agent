@@ -155,7 +155,7 @@ def run_tool(conn: sqlite3.Connection, name: str, args: dict | None, recent: lis
     season = context.stats_season(conn)
     try:
         if name == EXPLAIN:
-            return _explain(conn, season, args, recent or [])
+            return _explain(conn, me, season, args, recent or [])
         return _RUNNERS[name](conn, me, season, args)
     except (AmbiguousPlayer, PlayerNotFound) as e:
         return ToolResult(name, clarification=_clarify(e))
@@ -369,6 +369,18 @@ def _taxi_plan(conn, me, season, args) -> ToolResult:
 
 # Glossary terms whose full answer is a player's calculation when the user asks how.
 _VALUE_TERMS = {"win-now value", "three-year value", "situation score", "fppg"}
+# What each result is explained as, and the words that ask for a particular one.
+_KIND_OF_TOOL = {"set_lineup": "lineup", "evaluate_trade": "trade", "waiver_targets": "faab", "my_team": "verdict",
+                 "pick_advice": "pick"}
+_KIND_WORDS = {
+    "lineup": r"win prob|chance|z.?score|normal curve|opponent|projected|variance|bench|sit\b|start",
+    "trade": r"discount|arbitrage|market|net |total|trade|pick price",
+    "faab": r"\bbid|faab|budget|waiver|pickup|pick up",
+    "verdict": r"verdict|contend|rebuild|posture|percentile",
+    "pick": r"\bbuy\b|\bsell\b|\bhold\b|comparable|slot|tier",
+}
+_TERM_KIND = {"win probability": "lineup", "arbitrage": "trade", "discount rate": "trade", "market value": "trade",
+              "faab": "faab", "posture": "verdict"}
 _MAX_NAMES_LISTED = 6
 
 
@@ -391,41 +403,132 @@ def _glossary_result(definition: str) -> ToolResult:
     return ToolResult("explain", numbers=definition, compact={"definition": definition}, take=False)
 
 
-def _explain(conn, season, args, recent: list[ToolResult]) -> ToolResult:
-    topic = _blank_if_none(args.get("topic"))
-    player = _blank_if_none(args.get("player")) or explain.find_player(conn, season, topic) or ""
+def _explained(e: explain.Explanation) -> ToolResult:
+    return ToolResult("explain", numbers=e.text(), compact=e.summary(), data=e.subject)
 
-    def value_chain(player_id: str) -> ToolResult:
-        e = explain.explain_player_value(conn, season, player_id)
-        return ToolResult("explain", numbers=e.text(), compact=e.summary(), data=e.subject)
 
-    if player:
-        return value_chain(valuation.resolve_player(conn, _pin(conn, player))["player_id"])
-
-    hit = explain.lookup_glossary(topic)
-    wants_math = explain.wants_math(topic)
-    if hit and (hit[0] not in _VALUE_TERMS or not wants_math):
-        return _glossary_result(hit[1])
-
-    # A calculation with no player named: the player in the answer just shown, if there is one.
-    candidates: dict[str, str] = {}
+def _latest(recent: list[ToolResult], kind: str | None = None):
+    """(kind, result) for the newest answer that can be explained, skipping
+    explanations themselves; with kind, the newest of that kind. A player
+    explanation counts as ("player", its subject) when no kind is asked for,
+    so "why is his 3yr lower?" finds the player just explained."""
     for result in reversed(recent):
-        candidates = _players_in(result.data)
-        if candidates:
-            break
-    if len(candidates) == 1:
-        return value_chain(next(iter(candidates)))
-    if candidates:
-        names = list(candidates.values())
-        listed = ", ".join(names[:_MAX_NAMES_LISTED]) + (" or another player" if len(names) > _MAX_NAMES_LISTED else "")
-        return ToolResult("explain", clarification=f"Whose number should I walk through: {listed}?")
-    if hit:
-        return _glossary_result(hit[1])
+        if result.name == "explain":
+            if result.data and kind in (None, "player"):
+                return "player", result
+            continue
+        k = _KIND_OF_TOOL.get(result.name)
+        if k and (kind is None or kind == k):
+            return k, result
+    return None, None
+
+
+def _asked_kind(topic: str, term: str | None) -> str | None:
+    if term in _TERM_KIND:
+        return _TERM_KIND[term]
+    q = explain._normalize(topic)
+    for kind, words in _KIND_WORDS.items():
+        if re.search(words, q):
+            return kind
+    return None
+
+
+def _explain_kind(conn, me, season, kind: str, result: ToolResult | None, topic: str) -> ToolResult:
+    if kind == "verdict":
+        return _explained(explain.explain_verdict(conn, season, me))
+    if kind == "trade" and result is not None:
+        return _explained(explain.explain_trade(conn, result.data))
+    if kind == "lineup" and result is not None:
+        return _explained(explain.explain_lineup(result.data))
+    if kind == "faab":
+        data = result.data if result is not None else None
+        bids = [data] if isinstance(data, dict) else list(data or [])
+        named = explain.find_player(conn, season, topic)
+        if named:
+            bid = next((b for b in bids if b["player"] == named), None) or weekly.faab_recommendation(conn, season, me, named)
+        else:
+            bid = bids[0] if bids else next(iter(weekly.top_faab_targets(conn, season, me, limit=1)), None)
+        if bid is None:
+            return ToolResult("explain", clarification="Nobody on waivers would start for you right now, so there is no bid to explain.")
+        return _explained(explain.explain_faab(bid))
+    if kind == "pick":
+        report = result.data if result is not None else picks.pick_report(
+            conn, season, me, context.latest_complete_season(conn), context.scoring_settings(conn), me)
+        slotted = [r for r in report["rows"] if r.get("projected_slot") and r.get("comparable_value")]
+        year = re.search(r"\b(20\d\d)\b", topic)
+        rnd = re.search(r"\b(1st|first|2nd|second|3rd|third)\b|round\s*(\d)", topic.lower())
+        if year:
+            slotted = [r for r in slotted if str(r["season"]) == year.group(1)]
+        if rnd:
+            wanted = {"1st": 1, "first": 1, "2nd": 2, "second": 2, "3rd": 3, "third": 3}.get(rnd.group(1) or "", None) or int(rnd.group(2))
+            slotted = [r for r in slotted if r["round"] == wanted]
+        if len(slotted) == 1:
+            return _explained(explain.explain_pick(slotted[0]))
+        if slotted:
+            return ToolResult("explain", clarification="Which pick: " + ", ".join(f"{r['season']} {r['projected_slot']}" for r in slotted) + "?")
+        return ToolResult("explain", clarification="None of your picks is close enough to slot, so there is no buy, hold or sell call to explain.")
     return ToolResult(
         "explain",
-        clarification="Which number should I explain? Name a player, for example: how did you get Trey Benson's "
-                      "win-now value? Or ask what a term means, like situation score or arbitrage.",
+        clarification={"trade": "Ask me about a trade first, then I can walk through how it was evaluated.",
+                       "lineup": "Ask me who to start first, then I can walk through the win probability."}.get(
+            kind, "Which number should I explain?"),
     )
+
+
+def _explain(conn, me, season, args, recent: list[ToolResult]) -> ToolResult:
+    topic = _blank_if_none(args.get("topic"))
+    player = _blank_if_none(args.get("player")) or explain.find_player(conn, season, topic) or ""
+    hit = explain.lookup_glossary(topic)
+    term = hit[0] if hit else None
+    wants_math = explain.wants_math(topic)
+    asked = _asked_kind(topic, term)
+
+    def value_chain(player_id: str) -> ToolResult:
+        return _explained(explain.explain_player_value(conn, season, player_id))
+
+    if player:
+        if asked == "faab":
+            return _explain_kind(conn, me, season, "faab", _latest(recent, "faab")[1], topic)
+        if asked == "lineup" and _latest(recent, "lineup")[1] is not None:
+            return _explain_kind(conn, me, season, "lineup", _latest(recent, "lineup")[1], topic)
+        return value_chain(valuation.resolve_player(conn, _pin(conn, player))["player_id"])
+
+    if hit and not wants_math:
+        return _glossary_result(hit[1])
+    if hit and term not in _VALUE_TERMS:
+        # How a term is worked out: the calculation behind the answer just shown, else the definition.
+        kind, result = _latest(recent, asked)
+        if kind is None and asked not in ("verdict", "faab", "pick"):
+            return _glossary_result(hit[1])
+        return _explain_kind(conn, me, season, asked, result, topic)
+
+    if term in _VALUE_TERMS or asked is None:
+        kind, result = _latest(recent)
+        if term not in _VALUE_TERMS and kind not in (None, "player"):
+            return _explain_kind(conn, me, season, kind, result, topic)
+        subject = _players_in(result.data if kind == "player" else None)
+        candidates = subject
+        if not candidates:
+            for r in reversed(recent):
+                candidates = _players_in(r.data)
+                if candidates:
+                    break
+        if len(candidates) == 1:
+            return value_chain(next(iter(candidates)))
+        if candidates:
+            names = list(candidates.values())
+            listed = ", ".join(names[:_MAX_NAMES_LISTED]) + (" or another player" if len(names) > _MAX_NAMES_LISTED else "")
+            return ToolResult("explain", clarification=f"Whose number should I walk through: {listed}?")
+        if hit:
+            return _glossary_result(hit[1])
+        return ToolResult(
+            "explain",
+            clarification="Which number should I explain? Name a player, for example: how did you get Trey Benson's "
+                          "win-now value? Or ask what a term means, like situation score or arbitrage.",
+        )
+
+    kind, result = _latest(recent, asked)
+    return _explain_kind(conn, me, season, asked, result, topic)
 
 
 _RUNNERS = {
