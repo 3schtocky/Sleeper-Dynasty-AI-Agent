@@ -160,7 +160,29 @@ Model candidates, tested raw against Ollama's API with the same tool definitions
 - `qwen3:4b` (the reasoning model, 4.0B, Q4_K_M, reports tools support): routed both test questions correctly, however took a median ~50s per turn warm. Diagnosed, not guessed: 33 tokens/s generation, a normal speed, spent on ~400 tokens of reasoning before every tool call, even with Ollama's `think: false` (the reasoning moved into the visible answer instead of the thinking channel). Qwen's `/no_think` switch cut it only to 264 tokens. Also invented a fact it couldn't know (asked for week 1 in week 4).
 - `qwen3:4b-instruct` (same size, non-reasoning): median 1.6s per turn warm (0.6-1.9s; 18.5s once to load into memory), ~35 tokens generated, routed both questions correctly, invented nothing. The working choice; the bake-off in step 6 still decides it on a full question set.
 
+**Full bake-off, the same day** (`benchmarks/model_bench.py`: 16 real questions scored on tool and arguments, 3 answer tests scored on quoting the tool's real numbers without inventing any, writing speed), prompted by a goal of ~60 tokens/s. Generation is memory-bandwidth bound, so the levers were a smaller dense model, a mixture-of-experts model with ~1B active parameters, or lower-bit quantization (ruled out, quality cost):
+
+| Model | Tok/s fresh | Routing | Answers | Outcome |
+|---|---|---|---|---|
+| `qwen3:4b-instruct` | ~35 | 16/16 every run | 2/3 | chosen: never misrouted, never invented a number |
+| `gemma4:e2b` | ~50 | 15/16 | 1/3 | reversed "I'm offered X for Y" trades every run |
+| `qwen3.5:4b` | ~22 | 15/16 | 3/3 | best answers, 7.4s to pick a tool |
+| `qwen3.5:2b` (8-bit) | ~42 | 14/16 | 0/3 | listed draft picks as players |
+| `qwen3.5:2b-q4_K_M` | ~44 | - | - | Ollama's template errors on a tool call with no arguments ("XML syntax error"), a real compatibility bug for tools like set_lineup |
+| `qwen3:1.7b` | ~68 | 13/16 | 2/3 | swapped trade sides, turned a 2nd into a 1st, looked up Tom Brady for a pick question |
+| `granite4:7b-a1b-h` (MoE) | ~50 | 10/16 | 1/3 | flipped trades, invented a "2024 1st" |
+| `lfm2.5:8b-a1b` (MoE) | ~68 | 8/16 | 2/3 | reasons in `<think>` tags even with thinking off, ran out of budget before calling a tool |
+
+Conclusion, stated plainly: on a fanless MacBook Air M4, no tested model reaches 60 tokens/s while handling trades correctly; the two that reach it swap trade sides or spend the speed reasoning. Sustained load also throttles the fanless Air (re-timed after ~40 minutes of benchmarks, every model ran 20-45% slower; the chosen model fell from 35 to 19). A model that confidently evaluates the reverse of the user's trade is the worst failure this tool can have, so speed is designed for instead: Python writes the numbers block itself (instant, can't be misquoted), the model adds 1-3 sentences (~60 tokens, ~2s), output streams, the model is loaded while `refresh` runs so no cold start, and the model is a setting so a faster Mac can run a larger one.
+
+Two harness bugs of this project's own, found and fixed before trusting any score: "answer using only the numbers" made models reply with bare numbers, and a placeholder tool call in the grounding test crashed Qwen3.5's template; both reworded to match a real conversation.
+
+Models live in `~/Open Source Models` (the user's choice, outside the repo; `~/.ollama/models` links to it), inventoried in `MODELS.md` there.
+
 Design rules this surfaced, before any code: never ask the model for anything Python already knows (current week, the user's roster, the season), Python fills those in; and accept any reasonable argument format from the model (it wrote picks as "2027-1" in one run and "2027 1st" in the next), the tool layer normalizes.
+
+### User experience target
+`git clone`, then `uv run dynasty-agent` with no arguments opens a first-run setup: checks Ollama and downloads the model (saying the size first), asks the Sleeper username and league, loads the data with progress (replacing today's five first-run commands), asks what matters to the user (contending, rebuilding, trades, waivers, rookies), offers the daily refresh, then opens the chat with a short brief tuned to those priorities. Before building it, the user will run a first-time install from GitHub by hand to find where today's onboarding breaks.
 
 ### Build order
 1. [ ] Refactor: move printing out of `cli.py` into formatters, extract `digest` assembly into `weekly.py`, so the CLI and chat share one path returning plain dicts.
