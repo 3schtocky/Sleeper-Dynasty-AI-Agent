@@ -7,21 +7,10 @@ import json
 import sys
 from datetime import datetime
 
-from dynasty_agent import blend, college, config, market, matchup, nflverse, picks, prospect_model, prospects, refresh, schedule, sleeper, taxi, valuation, weather, weekly
+from dynasty_agent import blend, college, config, context, formatters, market, matchup, nflverse, picks, prospect_model, prospects, refresh, schedule, sleeper, taxi, valuation, weather, weekly
 from dynasty_agent.db import get_db
+from dynasty_agent.errors import AgentError
 from dynasty_agent.sleeper import SleeperClient
-
-
-def _require_config() -> None:
-    missing = config.missing_config()
-    if missing:
-        print(
-            f"Missing config: {', '.join(missing)}. Run "
-            f"`dynasty-agent init --username <your sleeper username>` to set it up, "
-            f"or copy .env.example to .env and fill it in by hand.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -56,7 +45,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"'{args.username}' is in {len(leagues)} {season} leagues:\n")
         for league in leagues:
             print(f"  {league['league_id']}  {league['name']}")
-        print(f"\nRe-run with --league-id <id> to pick one.")
+        print("\nRe-run with --league-id <id> to pick one.")
         raise SystemExit(1)
 
     # encoding explicit: Path.write_text() otherwise falls back to the OS
@@ -74,7 +63,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
     with SleeperClient(conn) as client:
         client.sync_all()
@@ -95,14 +84,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
 
 def cmd_roster(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
-    ).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
     rows = conn.execute(
         """
@@ -119,7 +103,7 @@ def cmd_roster(args: argparse.Namespace) -> None:
         ORDER BY CASE rp.slot WHEN 'starter' THEN 0 WHEN 'bench' THEN 1 WHEN 'taxi' THEN 2 ELSE 3 END,
                  mv.value DESC
         """,
-        (roster["roster_id"],),
+        (me,),
     ).fetchall()
 
     slot_labels = {"starter": "START", "bench": "BENCH", "taxi": "TAXI", "reserve": "IR"}
@@ -178,7 +162,7 @@ def cmd_fit_prospect_model(args: argparse.Namespace) -> None:
     if league is None:
         print("No league data cached yet. Run `dynasty-agent sync` first.", file=sys.stderr)
         raise SystemExit(1)
-    report = prospect_model.fit_and_store(conn, json.loads(league["scoring_settings_json"]), _latest_complete_season(conn))
+    report = prospect_model.fit_and_store(conn, json.loads(league["scoring_settings_json"]), context.latest_complete_season(conn))
     cov = report["coverage"]
     first, last = report["classes"]
     print(f"Prospect model fit on the {first}-{last} draft classes, drafted QB/RB/WR/TE, your league's scoring.")
@@ -303,7 +287,7 @@ def cmd_prospect_board(args: argparse.Namespace) -> None:
 
 
 def cmd_refresh(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
     started = datetime.now()
     print(f"=== dynasty-agent refresh, {started:%Y-%m-%d %H:%M} ===")
@@ -322,129 +306,32 @@ def cmd_refresh(args: argparse.Namespace) -> None:
 
 
 def cmd_picks(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent refresh` first.", file=sys.stderr)
-        raise SystemExit(1)
-    stats_season = _latest_ingested_season(conn)
-    league = conn.execute("SELECT scoring_settings_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    me = context.my_roster_id(conn)
+    stats_season = context.stats_season(conn)
     try:
         report = picks.pick_report(
-            conn, stats_season, roster["roster_id"], _latest_complete_season(conn),
-            json.loads(league["scoring_settings_json"]), None if args.all else roster["roster_id"],
+            conn, stats_season, me, context.latest_complete_season(conn),
+            context.scoring_settings(conn), None if args.all else me,
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
-
-    names = {
-        r["roster_id"]: (r["team_name"] or r["display_name"] or f"roster {r['roster_id']}")
-        for r in conn.execute(
-            "SELECT ro.roster_id, u.display_name, u.team_name FROM rosters ro LEFT JOIN users u ON u.user_id = ro.owner_id"
-        )
-    }
-    me = roster["roster_id"]
-    weight = report["record_weight"]
-    print(f"Rookie picks, {'every team' if args.all else 'yours'}. Next draft: {report['next_draft']}.")
-    print(
-        f"{report['next_draft']} slots are PROJECTED reverse standings: roster strength (best-lineup win-now) blended "
-        f"toward real record, record weighted {weight:.0%} so far (games played / regular-season games). "
-        f"Later drafts can't be slotted yet."
-    )
-    print(
-        f"Advice compares FantasyCalc's price for the pick with FantasyCalc's current value for the "
-        f"{report['recent_class']} rookies taken at that same slot: pick more than {picks.SELL_ABOVE:.2f}x the "
-        f"player it bought last year = SELL, under {picks.BUY_BELOW:.2f}x = BUY. History: that slot's rookies since "
-        f"{prospect_model.FIRST_TRAINING_CLASS}, league-weighted PPG over 3 seasons and how often they hit "
-        f"{picks.HIT_LEAGUE_PPG:g}+ (a weekly flex starter).\n"
-    )
-    header = f"{'Pick':<14} {'Holder':<16} {'From':<16} {'FCalc':>6} {'Comp':>6} {'Ratio':>5}  {'Advice':<8} {'Hist PPG':>8} {'Hit%':>5}"
-    print(header)
-    print("-" * len(header))
-    for r in report["rows"]:
-        slot = r["projected_slot"] or "  -  "
-        label = f"{r['season']} {slot}" + (f" {r['tier'][0]}" if r["tier"] else "")
-        if not r["projected_slot"]:
-            label = f"{r['season']} rd {r['round']}"
-        hist = r["history"] or {}
-        fmt = lambda v, spec: format(v, spec) if v is not None else "-"
-        holder = names.get(r["owner_roster_id"], "?")[:16]
-        origin = "own" if r["original_roster_id"] == r["owner_roster_id"] else names.get(r["original_roster_id"], "?")[:16]
-        mark = "*" if r["owner_roster_id"] == me else " "
-        print(
-            f"{label:<14}{mark}{holder:<16} {origin:<16} {fmt(r['fantasycalc_price'], '6.0f'):>6} "
-            f"{fmt(r.get('comparable_value'), '6.0f'):>6} {fmt(r['ratio'], '5.2f'):>5}  {r['advice'][:8]:<8} "
-            f"{fmt(hist.get('mean_league_ppg'), '8.1f'):>8} {fmt(hist.get('hit_rate') * 100 if hist else None, '4.0f'):>4}%"
-        )
-    slotted = [r for r in report["rows"] if r.get("comparable_players")]
-    if slotted and not args.all:
-        print("\nComparables (the recent rookies each projected slot actually bought):")
-        for r in slotted:
-            print(f"  {r['season']} {r['projected_slot']}: {', '.join(r['comparable_players'])}")
     verdict = valuation.contend_or_rebuild(conn, stats_season, me)
-    print(
-        f"\nYour posture: {verdict['verdict'].upper()} ({verdict['confidence']}). "
-        f"A contender sells picks for win-now help; a rebuilder holds or buys them."
-    )
+    print(formatters.format_picks(report, context.team_names(conn), me, verdict, args.all))
 
 
 def cmd_taxi(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent refresh` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
     try:
-        result = taxi.plan(conn, _latest_ingested_season(conn), roster["roster_id"])
+        result = taxi.plan(conn, context.stats_season(conn), me)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
-    st = result["settings"]
-    deadline = f"taxi deadline week {st['taxi_deadline']}" if st["taxi_deadline"] else "no taxi deadline (moves allowed all season)"
-    eligible = "rookies or veterans" if st["taxi_allow_vets"] else "rookies only"
-    print(
-        f"Taxi and IR plan. Your league: {st['taxi_slots']} taxi slots, {eligible}, {st['taxi_years']} year max, "
-        f"{deadline}; {st['reserve_slots']} IR slot. Taxi players can't be started.\n"
-    )
-    print(
-        f"Active roster: {result['active_count']} of {result['active_capacity']}. "
-        f"Taxi: {len(result['taxi_now'])} of {st['taxi_slots']} used. IR: {len(result['ir_now'])} of {st['reserve_slots']} used."
-    )
-    if result["moves"]:
-        print(f"\nRecommended moves, each frees a bench spot ({result['bench_spots_freed']} total):")
-        for m in result["moves"]:
-            p = m["player"]
-            print(
-                f"  {p['full_name']:<22} {p['position']:<3} -> {m['to']:<4}  {p['ppg']:.1f} PPG, "
-                f"3yr value {p['three_year_value']:.1f}: {m['why']}"
-            )
-        print("  Make these in the Sleeper app, this tool can't change your roster (Sleeper's API is read-only).")
-    else:
-        print("\nNo moves: every open taxi and IR slot is either filled or has no eligible player to put there.")
-    for p in result["keep_active"]:
-        print(f"  Keep {p['full_name']} active: taxi-eligible, but he's in your best lineup right now.")
-
-    print(f"\nNext season ({result['next_draft']} rookie draft):")
-    print(
-        f"  You hold {result['next_picks']} picks in that draft. Today's taxi players graduate back to the active roster; "
-        f"the new rookies can take the taxi slots. Projected: {result['roster_next']} players for {result['capacity_next']} spots."
-    )
-    if result["overflow"] > 0:
-        if result["cut_candidates"]:
-            print(f"  Roster crunch: {result['overflow']} cut(s) needed. Lowest three-year value among non-rookie non-starters:")
-            for p in result["cut_candidates"]:
-                print(f"    {p['full_name']:<22} {p['position']:<3} 3yr value {p['three_year_value']:.1f}")
-        else:
-            print(
-                f"  Roster crunch: {result['overflow']} cut(s) needed, and every non-rookie on your roster starts, "
-                f"so the cut would come from your lineup or a rookie."
-            )
-        print("  Or trade picks away before the draft; see `dynasty-agent picks`.")
-    else:
-        print("  No crunch: everyone fits, before any waiver adds between now and then.")
+    print(formatters.format_taxi(result))
 
 
 def cmd_schedule(args: argparse.Namespace) -> None:
@@ -462,7 +349,7 @@ def cmd_schedule(args: argparse.Namespace) -> None:
 
 def cmd_calibrate_blend(args: argparse.Namespace) -> None:
     conn = get_db()
-    season = args.season or _latest_complete_season(conn)
+    season = args.season or context.latest_complete_season(conn)
     try:
         vets, n_vets = blend.backtest_veterans(conn, season - 1, season)
         rookies, n_rookies = blend.backtest_rookies(conn, season)
@@ -487,151 +374,28 @@ def cmd_calibrate_blend(args: argparse.Namespace) -> None:
     print("\nThe constants in use live in blend.py with the run they came from; change them there if a new season disagrees.")
 
 
-def _latest_complete_season(conn) -> int:
-    """The most recent NFL season with every regular-season week played."""
-    row = conn.execute("SELECT season, season_type FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
-    if row is None or row["season"] is None:
-        print("No synced NFL state. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
-    return refresh.latest_complete_season(int(row["season"]), row["season_type"])
-
-
-def _latest_ingested_season(conn) -> int | None:
-    row = conn.execute("SELECT max(season) FROM weekly_stats").fetchone()
-    return int(row[0]) if row and row[0] is not None else None
-
-
 def cmd_valuate(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
-    ).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
-
-    season = args.season or _latest_ingested_season(conn)
-    if season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
-
-    valuations = valuation.player_valuations(conn, season)
-    print(_basis_line(season))
-    print(
-        "Situation score: average of QB passing EPA/game, team pass rate over expected, and sack rate "
-        "allowed (inverted), each percentile-ranked against all 32 NFL teams. Not a full offensive line "
-        "grade, real OL grades are paywalled; this is the public proxy.\n"
-    )
-
-    my_players = conn.execute(
-        "SELECT rp.player_id, rp.slot, p.full_name, p.position, p.age FROM roster_players rp "
-        "JOIN players p ON p.player_id = rp.player_id WHERE rp.roster_id = ?",
-        (roster["roster_id"],),
-    ).fetchall()
-
-    slot_order = {"starter": 0, "bench": 1, "taxi": 2, "reserve": 3}
-
-    def sort_key(row):
-        v = valuations.get(row["player_id"])
-        win_now = v["win_now_value"] if v else -1.0
-        return (slot_order.get(row["slot"], 9), -win_now)
-
-    my_players = sorted(my_players, key=sort_key)
-
-    slot_labels = {"starter": "START", "bench": "BENCH", "taxi": "TAXI", "reserve": "IR"}
-    header = f"{'Slot':<7} {'Player':<22} {'Pos':<4} {'Age':<4} {'FPPG':>6} {'Sit%':>6} {'WinNow':>8} {'3yr':>8}"
-    print(header)
-    print("-" * len(header))
-    for row in my_players:
-        v = valuations.get(row["player_id"])
-        label = slot_labels.get(row["slot"], row["slot"])
-        name = (row["full_name"] or "?")[:22]
-        pos = row["position"] or ""
-        age = str(row["age"]) if row["age"] is not None else "-"
-        if v is None:
-            print(f"{label:<7} {name:<22} {pos:<4} {age:<4} {'-':>6} {'-':>6} {'-':>8} {'-':>8}  (no {season} games)")
-            continue
-        print(
-            f"{label:<7} {name:<22} {pos:<4} {age:<4} "
-            f"{v['fantasy_points_per_game']:>6.1f} {v['situation_score']:>6.1f} "
-            f"{v['win_now_value']:>8.1f} {v['three_year_value']:>8.1f}{_rookie_note(v)}"
-        )
-
-    if any(valuations.get(r["player_id"], {}).get("value_source") == "prospect_model" for r in my_players):
-        print(_ROOKIE_FOOTNOTE)
-
-    verdict = valuation.contend_or_rebuild(conn, season, roster["roster_id"])
-    print()
-    print(f"Verdict: {verdict['verdict'].upper()}")
-    print(f"Confidence: {verdict['confidence']}")
-    print(
-        f"Inputs: win-now total {verdict['my_win_now_total']:.1f} "
-        f"({verdict['win_now_percentile']:.0f}th percentile of {len(verdict['league_win_now_totals'])} teams), "
-        f"three-year total {verdict['my_three_year_total']:.1f} "
-        f"({verdict['three_year_percentile']:.0f}th percentile of {len(verdict['league_three_year_totals'])} teams), "
-        f"{verdict['games_played']} games played this season."
-    )
-
-
-_ROOKIE_FOOTNOTE = (
-    f"\n* Rookie: FPPG starts from the prospect model's projection from real draft capital (fit on 2018-2023 "
-    f"classes), worth {blend.ROOKIE_PRIOR_GAMES:g} games, with his real games this season blended in on top. The "
-    f"projection is points per game scheduled over a first 3 seasons, so it runs a little conservative next to a "
-    f"veteran's per-game-played average. Run `prospect-board` for the inputs."
-)
-
-
-def _basis_line(season: int) -> str:
-    return (
-        f"Valuation basis: the {season} season to date, blended with {season - 1}: last season's average counts as "
-        f"{blend.VETERAN_PRIOR_GAMES:g} games and each real {season} game adds on top (chosen by backtest, see "
-        f"`calibrate-blend`), so the new season takes over as it accumulates."
-    )
-
-
-def _rookie_note(v: dict) -> str:
-    if v.get("value_source") != "prospect_model":
-        return ""
-    games = f" + {v['games']} games" if v.get("games") else ""
-    if v.get("undrafted"):
-        return f"  * rookie, undrafted (priced as the last pick, outside the model's training data){games}"
-    return f"  * rookie, projected from pick {v['draft_pick']}{games}"
-
-
-def _parse_pick(spec: str) -> tuple[int, int]:
-    """Parse 'SEASON-ROUND', e.g. '2027-1', into (season, round)."""
-    parts = spec.split("-")
-    if len(parts) != 2:
-        raise ValueError(f"pick must look like '2027-1' (season-round), got '{spec}'")
-    try:
-        return int(parts[0]), int(parts[1])
-    except ValueError:
-        raise ValueError(f"pick must look like '2027-1' (season-round), got '{spec}'")
+    me = context.my_roster_id(conn)
+    season = context.stats_season(conn, args.season)
+    print(formatters.format_my_team(valuation.my_team(conn, season, me)))
 
 
 def cmd_trade(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute(
-        "SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)
-    ).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    season = args.season or _latest_ingested_season(conn)
-    if season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
+    season = context.stats_season(conn, args.season)
 
     try:
-        send_picks = [_parse_pick(p) for p in (args.send_pick or [])]
-        receive_picks = [_parse_pick(p) for p in (args.receive_pick or [])]
+        send_picks = [picks.parse_league_pick(conn, p) for p in (args.send_pick or [])]
+        receive_picks = [picks.parse_league_pick(conn, p) for p in (args.receive_pick or [])]
         result = valuation.evaluate_trade(
             conn,
             season,
-            roster["roster_id"],
+            me,
             send_players=args.send or [],
             send_picks=send_picks,
             receive_players=args.receive or [],
@@ -642,75 +406,7 @@ def cmd_trade(args: argparse.Namespace) -> None:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
-    def print_side(label: str, side: dict) -> None:
-        print(f"{label}:")
-        if not side["players"] and not side["picks"]:
-            print("  (nothing)")
-        for p in side["players"]:
-            note = _rookie_note(p) if p["has_data"] else "  (no games this season, my-model valuation is 0)"
-            market_str = f"{p['market_value']:.0f}" if p["market_value"] is not None else "-"
-            print(
-                f"  {p['full_name']:<22} {p['position'] or '':<4} "
-                f"win-now {p['win_now_value']:>6.1f}  3yr(mine) {p['three_year_value']:>6.1f}  "
-                f"market {market_str:>6}{note}"
-            )
-        for pk in side["picks"]:
-            model_str = f"{pk['model_value']:.0f}" if pk["model_value"] is not None else "-"
-            market_str = f"{pk['market_value']:.0f}" if pk["market_value"] is not None else "-"
-            arb_str = f"{pk['arbitrage']:+.0f}" if pk["arbitrage"] is not None else "-"
-            print(
-                f"  {pk['label']:<22} {'PICK':<4} "
-                f"model {model_str:>6}  market {market_str:>6}  arbitrage {arb_str:>7}"
-            )
-        print(
-            f"  totals: win-now (players only) {side['win_now_total']:.1f}, "
-            f"3yr mine (players only) {side['player_three_year_total']:.1f}, "
-            f"market value (players + picks, comparable) {side['market_value_total']:.0f}"
-        )
-        if side["unpriced"]:
-            print(f"  WARNING: no market price for {', '.join(side['unpriced'])}, counted as 0 in the market total above.")
-
-    print(f"Trade evaluation, pick discount rate {args.discount_rate:.0%} per year.")
-    print(_basis_line(season))
-    print(
-        "Win-now and 3yr(mine) are this league's own formula, players only, picks can't help you win "
-        "this year so they don't appear there. Market value is FantasyCalc's own pricing for players plus "
-        "my discount-adjusted pick model, the only number below that's comparable across players and picks "
-        "together.\n"
-    )
-    print_side("You send", result["sent"])
-    print()
-    print_side("You receive", result["received"])
-    if any(p.get("value_source") == "prospect_model" for side in (result["sent"], result["received"]) for p in side["players"]):
-        print(_ROOKIE_FOOTNOTE)
-    print()
-    print(f"Net win-now (players only): {result['win_now_delta']:+.1f}")
-    print(f"Net 3yr, mine (players only): {result['player_three_year_delta']:+.1f}")
-    print(f"Net market value (players + picks): {result['market_value_delta']:+.0f}")
-    print(f"Your posture: {result['posture'].upper()} ({result['posture_confidence']})")
-    print(f"Fit: {result['fit']}")
-    if result["consolidation"]:
-        print(f"Note: {result['consolidation']}")
-
-
-def _resolve_vegas_season(conn, explicit_vegas_season: int | None) -> int:
-    """The season --week's Vegas lines belong to. The real current NFL
-    season from the last sync when not given explicitly, never inferred
-    from the FPPG baseline season: week 1 of a completed season already
-    has real closing lines from last year's game, so any presence-based
-    fallback silently prices the wrong year. See matchup.predict_matchup's
-    docstring for the bug this replaced."""
-    if explicit_vegas_season is not None:
-        return explicit_vegas_season
-    state_row = conn.execute("SELECT season FROM nfl_state ORDER BY fetched_at DESC LIMIT 1").fetchone()
-    if state_row is None:
-        print(
-            "No synced NFL state to determine the current season. Run `dynasty-agent sync` first, "
-            "or pass --vegas-season explicitly.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    return int(state_row["season"])
+    print(formatters.format_trade(result, season))
 
 
 def cmd_predict_matchup(args: argparse.Namespace) -> None:
@@ -719,12 +415,9 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
         print("No player data yet. Run `dynasty-agent init` and `dynasty-agent sync` first.", file=sys.stderr)
         raise SystemExit(1)
 
-    season = args.season or _latest_ingested_season(conn)
-    if season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
+    season = context.stats_season(conn, args.season)
 
-    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+    vegas_season = context.vegas_season(conn, args.vegas_season)
 
     try:
         result = matchup.predict_matchup(conn, season, vegas_season, args.week, args.team_a or [], args.team_b or [])
@@ -771,158 +464,82 @@ def cmd_predict_matchup(args: argparse.Namespace) -> None:
 
 
 def cmd_optimize_lineup(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
-
-    stats_season = args.season or _latest_ingested_season(conn)
-    if stats_season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
-    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
-
-    with SleeperClient(conn) as client:
-        client.sync_matchups(args.week)
+    me = context.my_roster_id(conn)
+    stats_season = context.stats_season(conn, args.season)
+    vegas_season = context.vegas_season(conn, args.vegas_season)
+    sync_note = weekly.sync_matchups_or_note(conn, args.week)
 
     try:
-        result = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, roster["roster_id"])
+        result = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, me)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
-
-    if result["unsupported_slots"]:
-        print(
-            f"Warning: this league's roster has starting slot types this optimizer doesn't handle yet: "
-            f"{result['unsupported_slots']}. Those slots were left unfilled.\n"
-        )
-
-    print(f"Lineup optimizer, {stats_season} season FPPG basis, week {args.week} of the {vegas_season} season.")
-    print("Picks by win probability against your real Sleeper opponent, not raw projected points.\n")
-
-    if result["opponent_note"]:
-        print(f"Opponent: {result['opponent_note']}\n")
-    else:
-        print(
-            f"Opponent (roster {result['opponent_roster_id']}): projected "
-            f"{result['opponent_mean']:.1f} ± {result['opponent_variance'] ** 0.5:.1f}\n"
-        )
-
-    print("Recommended lineup:")
-    for p in result["recommended_lineup"]:
-        flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
-        vegas_note = f", vegas x{p['vegas_multiplier']:.2f}" if p["vegas_multiplier"] != 1.0 else ""
-        bye_note = "  BYE WEEK" if p["on_bye"] else ""
-        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f} var={p['variance']:>5.1f}{vegas_note}{flag}{bye_note}")
-
-    if result["recommended_win_probability"] is not None:
-        print(f"\nWin probability: {result['recommended_win_probability']:.1%}")
-    else:
-        print("\nWin probability: n/a, could not assemble a full valid lineup, check unsupported_slots above")
-
-    if result["differs_from_points_max"]:
-        print(
-            f"\nNote: this differs from the highest-raw-points lineup ({result['points_max_total']:.1f} pts). "
-            f"The flex slot is doing real work here, trading a little mean for a better win probability "
-            f"given this specific matchup, not just stacking points."
-        )
-
-    print("\nBench:")
-    for p in sorted(result["bench"], key=lambda p: -p["mean"]):
-        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}")
+    print(formatters.format_lineup(result, stats_season, vegas_season, sync_note))
 
 
 def cmd_faab(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    stats_season = args.season or _latest_ingested_season(conn)
-    if stats_season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
+    stats_season = context.stats_season(conn, args.season)
 
     try:
-        result = weekly.faab_recommendation(conn, stats_season, roster["roster_id"], args.player)
+        result = weekly.faab_recommendation(conn, stats_season, me, args.player)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
-    print(f"FAAB recommendation for {result['player']} ({result['position']})")
-    if result["is_rostered"]:
-        print("Warning: this player is already on a roster in your league, not actually a free agent right now.")
-    budget_note = " (league settings carry no waiver_budget, assumed Sleeper's default)" if result["budget_is_default"] else ""
-    print(
-        f"\nRemaining budget: ${result['remaining_budget']} of ${result['total_budget']}{budget_note}, "
-        f"{result['weeks_left']} weeks left before the playoffs."
-    )
-    print(
-        f"Win-now value: {result['target_win_now_value']:.1f} "
-        f"({result['percentile_among_available']:.0f}th percentile among players actually available on waivers, "
-        f"not everyone in the league)."
-    )
-    print(
-        f"Base pace, remaining budget split evenly across the weeks left: ${result['base_per_week_budget']:.2f}/week, "
-        f"scaled ×{result['value_multiplier']:.2f} for this target's value."
-    )
-    print(f"\nSuggested bid: ${result['suggested_bid']}")
+    print(formatters.format_faab(result))
 
 
 def cmd_digest(args: argparse.Namespace) -> None:
-    _require_config()
+    context.require_config()
     conn = get_db()
-    roster = conn.execute("SELECT roster_id FROM rosters WHERE owner_id = ?", (config.SLEEPER_USER_ID,)).fetchone()
-    if roster is None:
-        print("No roster found for this user. Run `dynasty-agent sync` first.", file=sys.stderr)
-        raise SystemExit(1)
+    me = context.my_roster_id(conn)
 
-    stats_season = args.season or _latest_ingested_season(conn)
-    if stats_season is None:
-        print("No nflverse data ingested yet. Run `dynasty-agent ingest-nflverse --season <year>` first.", file=sys.stderr)
-        raise SystemExit(1)
-    vegas_season = _resolve_vegas_season(conn, args.vegas_season)
+    stats_season = context.stats_season(conn, args.season)
+    vegas_season = context.vegas_season(conn, args.vegas_season)
 
-    with SleeperClient(conn) as client:
-        client.sync_matchups(args.week)
-
-    print(f"=== Week {args.week} digest, {stats_season} season FPPG basis, {vegas_season} season Vegas lines ===\n")
+    sync_note = weekly.sync_matchups_or_note(conn, args.week)
 
     try:
-        lineup = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, roster["roster_id"])
+        lineup = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, me)
+        targets = weekly.top_faab_targets(conn, stats_season, me)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
-
-    print("Start:")
+    winds = {}
     for p in lineup["recommended_lineup"]:
-        flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
-        wind_note = ""
         if p["team"] and not p["on_bye"]:
             w = weather.game_wind_forecast(vegas_season, args.week, p["team"])
             if w["status"] == "ok" and w["flag"]:
-                wind_note = f"  WIND {w['wind_mph']:.0f} mph at {w['stadium']}"
-        bye_note = "  BYE WEEK" if p["on_bye"] else ""
-        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}{flag}{wind_note}{bye_note}")
+                winds[p["player_id"]] = f"  WIND {w['wind_mph']:.0f} mph at {w['stadium']}"
+    print(formatters.format_digest(lineup, targets, winds, stats_season, vegas_season, sync_note))
 
-    if lineup["recommended_win_probability"] is not None:
-        print(f"\nWin probability: {lineup['recommended_win_probability']:.1%}")
-    if lineup["differs_from_points_max"]:
-        print("Chosen over the pure-points lineup for a better win probability against this week's specific opponent.")
 
-    print("\nSit (top bench by projection):")
-    for p in sorted(lineup["bench"], key=lambda p: -p["mean"])[:5]:
-        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}")
+def cmd_chat(args: argparse.Namespace) -> None:
+    from dynasty_agent import chat
 
-    print("\nFAAB targets (highest win-now value actually available on waivers right now):")
-    for bid in weekly.top_faab_targets(conn, stats_season, roster["roster_id"]):
-        print(f"  {bid['player']:<20} {bid['position']:<3} value={bid['target_win_now_value']:>5.1f}  suggested bid ${bid['suggested_bid']}")
+    context.require_config()
+    chat.run(get_db(), do_refresh=not args.no_refresh)
 
-    print("\nThis is DRAFT-heuristic math throughout (see matchup.py, PLANNING.md), not a calibrated prediction.")
+
+def cmd_chat_eval(args: argparse.Namespace) -> None:
+    from dynasty_agent import chat_eval, llm
+
+    with llm.OllamaClient(model=args.model or llm.LLM_MODEL) as client:
+        client.ensure_ready()
+        client.warm()
+        report = chat_eval.run_live(client, record=args.record)
+    for r in report["results"]:
+        print(f"  {'ok  ' if r['ok'] else 'FAIL'} {r['seconds']:>5.2f}s  [{r['kind']}] {r['question']}"
+              + (f"\n         {r['why']}" if r["why"] else ""))
+    print(f"\n{report['model']}: {report['passed']} of {report['total']} routed correctly, {report['seconds']}s.")
+    if args.record:
+        print(f"Recorded to {chat_eval.RECORDING.relative_to(config.PROJECT_ROOT)}; tests/test_chat_routing.py replays it.")
 
 
 def main() -> None:
@@ -1053,17 +670,20 @@ def main() -> None:
     )
     trade_parser.add_argument("--send", action="append", metavar="PLAYER", help="A player you would send. Repeatable.")
     trade_parser.add_argument(
-        "--send-pick", action="append", metavar="SEASON-ROUND", help="A pick you would send, e.g. 2027-1. Repeatable."
+        "--send-pick", action="append", metavar="PICK",
+        help="A pick you would send: 2027-1, '2027 1st', '2027 early 1st' or '2027 1.05'. Repeatable."
     )
     trade_parser.add_argument(
         "--receive", action="append", metavar="PLAYER", help="A player you would receive. Repeatable."
     )
     trade_parser.add_argument(
-        "--receive-pick", action="append", metavar="SEASON-ROUND", help="A pick you would receive, e.g. 2027-1. Repeatable."
+        "--receive-pick", action="append", metavar="PICK",
+        help="A pick you would receive, written like --send-pick. Name a tier or slot for a tiered price. Repeatable."
     )
     trade_parser.add_argument(
-        "--discount-rate", type=float, default=0.20,
-        help="Per-year discount applied to future pick values beyond the base season (default 0.20 = 20%% per year).",
+        "--discount-rate", type=float, default=picks.valuation_discount_rate(),
+        help=f"Per-year discount applied to future pick values beyond the base season "
+        f"(default {picks.valuation_discount_rate():.2f}, set in picks.py).",
     )
     trade_parser.add_argument(
         "--season", type=int, default=None, help="Valuation basis season. Defaults to the most recently ingested season."
@@ -1127,8 +747,31 @@ def main() -> None:
     )
     digest_parser.set_defaults(func=cmd_digest)
 
+    chat_parser = sub.add_parser(
+        "chat",
+        help="[Phase 5 preview] Ask about your league in plain English, answered by a local model (Ollama) that "
+        "routes to these commands; every number comes from them, not the model.",
+    )
+    chat_parser.add_argument(
+        "--no-refresh", action="store_true",
+        help="Skip the session-start refresh (quicker restarts; the data may be stale).",
+    )
+    chat_parser.set_defaults(func=cmd_chat)
+
+    eval_parser = sub.add_parser(
+        "chat-eval",
+        help="[Phase 5] Score the local model's routing on the chat's real questions, including trade direction.",
+    )
+    eval_parser.add_argument("--model", default=None, help="An Ollama model to score instead of LLM_MODEL.")
+    eval_parser.add_argument("--record", action="store_true", help="Save the answers for the offline routing test.")
+    eval_parser.set_defaults(func=cmd_chat_eval)
+
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except AgentError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

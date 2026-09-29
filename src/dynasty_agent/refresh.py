@@ -96,7 +96,7 @@ def run(conn: sqlite3.Connection, today: date | None = None) -> list[dict]:
         _step(results, f"NFL stats {season - 1} (blend prior)", lambda: nflverse.ingest_season(conn, season - 1, scoring))
     if season_type in IN_SEASON_TYPES:
         _step(results, f"NFL stats {season}", lambda: nflverse.ingest_season(conn, season, scoring, force=True))
-        _step(results, f"NFL schedules and lines", lambda: str(nflverse.ensure_games_cached(force=True).name) + " refreshed")
+        _step(results, "NFL schedules and lines", lambda: str(nflverse.ensure_games_cached(force=True).name) + " refreshed")
     if season_type == "regular" and week:
         def matchups() -> str:
             with SleeperClient(conn) as client:

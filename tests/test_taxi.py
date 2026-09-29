@@ -73,3 +73,43 @@ def test_plan_flags_a_crunch_and_names_cut_candidates(conn):
     # 6 rostered + 3 picks = 9 players; 6 active spots + 2 taxi for rookies = 8.
     assert (result["roster_next"], result["capacity_next"], result["overflow"]) == (9, 8, 1)
     assert [p["player_id"] for p in result["cut_candidates"]] == []  # every non-rookie here starts
+
+
+def test_after_the_taxi_deadline_only_ir_moves_are_suggested(conn):
+    conn.execute("UPDATE league SET settings_json = ?", (json.dumps({**SETTINGS, "taxi_deadline": 3}),))
+    conn.execute("INSERT INTO nfl_state (fetched_at, season, week) VALUES ('t', '2026', 5)")
+    result = taxi.plan(conn, 2026, 1)
+    assert result["taxi_locked"]
+    assert [(m["player"]["player_id"], m["to"]) for m in result["moves"]] == [("rookie_ir", "IR")]
+
+
+def test_before_the_deadline_taxi_moves_still_count(conn):
+    conn.execute("UPDATE league SET settings_json = ?", (json.dumps({**SETTINGS, "taxi_deadline": 8}),))
+    conn.execute("INSERT INTO nfl_state (fetched_at, season, week) VALUES ('t', '2026', 5)")
+    assert not taxi.plan(conn, 2026, 1)["taxi_locked"]
+    assert not taxi.taxi_locked({"taxi_deadline": 0}, 17)  # 0 means no deadline
+
+
+def test_graduating_names_the_rookies_moved_to_taxi(conn):
+    result = taxi.plan(conn, 2026, 1)
+    assert [p["player_id"] for p in result["graduating"]] == ["rookie_a", "rookie_b"]
+
+
+def test_an_injured_starter_is_never_a_cut_candidate(conn, monkeypatch):
+    # The WR starter goes Out: out of this week's lineup, still the season's
+    # best WR. Crunch the roster so a cut is needed.
+    conn.execute("UPDATE players SET injury_status = 'Out' WHERE player_id = 'wr'")
+    conn.execute("INSERT INTO players (player_id, full_name, position, years_exp, fetched_at) VALUES ('wr2', 'wr2', 'WR', 4, 't')")
+    conn.execute("INSERT INTO roster_players (roster_id, player_id, slot, fetched_at) VALUES (1, 'wr2', 'bench', 't')")
+    vals = valuation.player_valuations(conn, 2026)
+    vals["wr2"] = {"fantasy_points_per_game": 5.0, "win_now_value": 5.0, "three_year_value": 5.0, "position": "WR"}
+    result = taxi.plan(conn, 2026, 1)
+    assert result["overflow"] > 0
+    assert "wr" not in [p["player_id"] for p in result["cut_candidates"]]
+    assert "wr2" in [p["player_id"] for p in result["cut_candidates"]]
+
+
+def test_ir_wording_follows_the_slot_count(conn):
+    conn.execute("UPDATE league SET settings_json = ?", (json.dumps({**SETTINGS, "reserve_slots": 2}),))
+    why = next(m["why"] for m in taxi.plan(conn, 2026, 1)["moves"] if m["to"] == "IR")
+    assert why == "designated IR, an IR slot is open"

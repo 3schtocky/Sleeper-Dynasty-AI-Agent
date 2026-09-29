@@ -42,14 +42,14 @@ FANTASYCALC_PARAMS = {
 def missing_config() -> list[str]:
     """Which required .env variables are unset, empty list if none. Used to
     give a clear "run init first" message instead of a confusing API error
-    for a None league_id."""
+    for a None league_id. DRAFT_ID is not required: no command reads it, and
+    `init` writes it empty for a league whose rookie draft isn't created yet."""
     return [
         name
         for name, value in [
             ("SLEEPER_USERNAME", SLEEPER_USERNAME),
             ("SLEEPER_USER_ID", SLEEPER_USER_ID),
             ("LEAGUE_ID", LEAGUE_ID),
-            ("DRAFT_ID", DRAFT_ID),
         ]
         if not value
     ]

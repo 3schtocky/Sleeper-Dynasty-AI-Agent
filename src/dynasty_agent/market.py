@@ -22,15 +22,27 @@ BASE_URL = "https://api.fantasycalc.com/values/current"
 CACHE_TTL_SECONDS = 6 * 3600
 
 
+# The parsed response per (cache key, fetched_at): pricing a pick report's
+# picks read and re-parsed the same ~400 KB response 250 times per run.
+# Keyed on fetched_at, so a refetch is seen immediately. Callers must not
+# mutate the returned list.
+_parsed: dict[str, tuple[str, list[dict]]] = {}
+
+
 def fetch_values(conn: sqlite3.Connection) -> list[dict]:
     cache_key = "fantasycalc:values/current:" + json.dumps(FANTASYCALC_PARAMS, sort_keys=True)
     row = conn.execute(
-        "SELECT response_json, fetched_at FROM api_cache WHERE cache_key = ?", (cache_key,)
+        "SELECT fetched_at FROM api_cache WHERE cache_key = ?", (cache_key,)
     ).fetchone()
     if row is not None:
         fetched_at = datetime.fromisoformat(row["fetched_at"])
         if datetime.now(timezone.utc) - fetched_at < timedelta(seconds=CACHE_TTL_SECONDS):
-            return json.loads(row["response_json"])
+            memo = _parsed.get(cache_key)
+            if memo is None or memo[0] != row["fetched_at"]:
+                response = conn.execute("SELECT response_json FROM api_cache WHERE cache_key = ?", (cache_key,)).fetchone()
+                memo = (row["fetched_at"], json.loads(response["response_json"]))
+                _parsed[cache_key] = memo
+            return memo[1]
 
     response = httpx.get(BASE_URL, params=FANTASYCALC_PARAMS, timeout=20.0)
     response.raise_for_status()
@@ -101,7 +113,9 @@ def latest_value(conn: sqlite3.Connection, player_id: str) -> float | None:
     return row["value"] if row else None
 
 
-_PICK_ROUND_LABELS = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}
+def round_label(round_num: int) -> str:
+    """FantasyCalc's round wording: 1st, 2nd, 3rd, 4th."""
+    return {1: "1st", 2: "2nd", 3: "3rd"}.get(round_num, f"{round_num}th")
 
 
 def priced_pick_seasons(conn: sqlite3.Connection, round_num: int) -> list[int]:
@@ -109,7 +123,7 @@ def priced_pick_seasons(conn: sqlite3.Connection, round_num: int) -> list[int]:
     for, ascending. Read from the live response, not assumed: FantasyCalc
     drops a season once that rookie draft has happened, so the earliest
     priced season moves forward every spring."""
-    label_suffix = f" {_PICK_ROUND_LABELS.get(round_num, f'{round_num}th')}"
+    label_suffix = f" {round_label(round_num)}"
     seasons = []
     for entry in fetch_values(conn):
         player = entry.get("player") or {}
@@ -121,17 +135,27 @@ def priced_pick_seasons(conn: sqlite3.Connection, round_num: int) -> list[int]:
     return sorted(set(seasons))
 
 
-def pick_market_value(conn: sqlite3.Connection, season: int, round_num: int) -> float | None:
-    """FantasyCalc's own unslotted market value for a future draft pick, for
-    example "2027 1st", read from the same cached response sync_market_values
-    already fetches. None if FantasyCalc doesn't price that year and round,
-    it only prices a handful of years out."""
-    label = f"{season} {_PICK_ROUND_LABELS.get(round_num, f'{round_num}th')}"
+def pick_price(conn: sqlite3.Connection, season: int, round_num: int, tier: str | None = None) -> tuple[float | None, str | None]:
+    """FantasyCalc's price for a pick and the label it came from. With a
+    tier ("Early", "Mid", "Late") it's "2027 1st (Early)" when FantasyCalc
+    prices tiers for that season (the next draft only, today), else the
+    untiered "2027 1st". (None, None) when FantasyCalc doesn't price that
+    year and round at all; it only prices a few years out. The one pick
+    price the trade evaluator and the pick report both use."""
+    label = f"{season} {round_label(round_num)}"
+    wanted = [f"{label} ({tier})", label] if tier else [label]
+    prices = {}
     for entry in fetch_values(conn):
         player = entry.get("player") or {}
-        if player.get("position") == "PICK" and player.get("name") == label:
-            return entry.get("value")
-    return None
+        if player.get("position") == "PICK" and player.get("name") in wanted:
+            prices[player["name"]] = entry.get("value")
+    used = next((w for w in wanted if w in prices), None)
+    return (prices[used], used) if used else (None, None)
+
+
+def pick_market_value(conn: sqlite3.Connection, season: int, round_num: int, tier: str | None = None) -> float | None:
+    """pick_price's value alone."""
+    return pick_price(conn, season, round_num, tier)[0]
 
 
 def value_trend(conn: sqlite3.Connection, player_id: str, days: int) -> float | None:

@@ -75,6 +75,150 @@ def test_fantasycalc_pick_price_prefers_the_tier_and_falls_back(conn, monkeypatc
         {"player": {"position": "PICK", "name": "2028 1st"}, "value": 2060},
     ]
     monkeypatch.setattr(market, "fetch_values", lambda conn: values)
-    assert picks.fantasycalc_pick_price(conn, 2027, 1, "Early") == 4616
-    assert picks.fantasycalc_pick_price(conn, 2028, 1, "Early") == 2060  # no tiers priced that far out
-    assert picks.fantasycalc_pick_price(conn, 2029, 1, None) is None
+    assert market.pick_price(conn, 2027, 1, "Early") == (4616, "2027 1st (Early)")
+    assert market.pick_price(conn, 2028, 1, "Early") == (2060, "2028 1st")  # no tiers priced that far out
+    assert market.pick_price(conn, 2029, 1, None) == (None, None)
+    assert market.pick_market_value(conn, 2027, 1) == 2839
+
+
+# -- reading a pick the way people write it ------------------------------------------
+
+
+@pytest.mark.parametrize("spec", [
+    "2027-1", "2027 1st", "2027 round 1", "'27 first", "’27 1st", "2027-1st", "2027 1", "27 1st",
+    "2027 first round", "1st round 2027", "2027 rd 1", "2027 R1", "2027 1st round pick", "2027, 1st",
+])
+def test_parse_pick_reads_every_common_way_to_write_a_2027_first(spec):
+    assert picks.parse_pick(spec) == picks.Pick(2027, 1)
+
+
+def test_parse_pick_reads_tiers_and_slots():
+    assert picks.parse_pick("2027 early 1st") == picks.Pick(2027, 1, "Early")
+    assert picks.parse_pick("2027 1st (Late)") == picks.Pick(2027, 1, "Late")
+    assert picks.parse_pick("2027 mid second") == picks.Pick(2027, 2, "Mid")
+    assert picks.parse_pick("2027 1.05") == picks.Pick(2027, 1, "Mid", 5)  # 12 teams: 1-4 early, 5-8 mid
+    assert picks.parse_pick("2027 2.11") == picks.Pick(2027, 2, "Late", 11)
+    assert picks.parse_pick("2028 3rd") == picks.Pick(2028, 3)
+
+
+@pytest.mark.parametrize("spec", ["", "2027", "first", "a 1st", "Justin Jefferson"])
+def test_parse_pick_rejects_what_isnt_a_pick(spec):
+    with pytest.raises(ValueError, match="Couldn't read"):
+        picks.parse_pick(spec)
+
+
+def test_next_years_pick_means_the_next_draft_when_the_league_is_known():
+    for spec in ("next year's 1st", "next year first", "next draft 2nd", "my upcoming 1st"):
+        assert picks.parse_pick(spec, first_season=2027).season == 2027
+    with pytest.raises(ValueError, match="Couldn't read"):
+        picks.parse_pick("next year's 1st")  # without the league, "next year" is unknown
+
+
+def test_parse_pick_checks_the_leagues_bounds():
+    kwargs = {"rounds": 3, "first_season": 2027, "last_season": 2029, "num_teams": 12}
+    with pytest.raises(ValueError, match="3 rounds, there's no round 4"):
+        picks.parse_pick("2027 4th", **kwargs)
+    with pytest.raises(ValueError, match="2026 rookie draft already happened"):
+        picks.parse_pick("2026 1st", **kwargs)
+    with pytest.raises(ValueError, match="through the 2029 draft"):
+        picks.parse_pick("2030 1st", **kwargs)
+    with pytest.raises(ValueError, match="1.01 through 1.12"):
+        picks.parse_pick("2027 1.13", **kwargs)
+
+
+def test_parse_league_pick_reads_the_leagues_own_settings(conn):
+    # The fixture league: 2026 season, 2 rounds, 3 teams.
+    assert picks.parse_league_pick(conn, "2027 2nd") == picks.Pick(2027, 2)
+    assert picks.parse_league_pick(conn, "2027 1.03") == picks.Pick(2027, 1, "Late", 3)
+    with pytest.raises(ValueError, match="2 rounds"):
+        picks.parse_league_pick(conn, "2027 3rd")
+
+
+def test_next_draft_is_an_unfinished_draft_sleeper_lists_else_after_the_league_season(conn):
+    assert picks.next_draft_season(conn) == 2027
+    conn.execute("INSERT INTO drafts (draft_id, league_id, season, status, fetched_at) VALUES ('d', 'L1', '2026', 'pre_draft', 't')")
+    assert picks.next_draft_season(conn) == 2026  # a renewed league before its rookie draft
+    conn.execute("UPDATE drafts SET status = 'complete'")
+    assert picks.next_draft_season(conn) == 2027
+
+
+# -- one price for a pick, whichever tool asks -----------------------------------------
+
+
+def test_my_own_next_draft_pick_is_priced_at_its_projected_tier(conn, monkeypatch):
+    monkeypatch.setattr(valuation, "contend_or_rebuild", lambda conn, s, rid: {"league_win_now_totals": {1: 50.0, 2: 150.0, 3: 100.0}})
+    # Roster 1 is weakest: its own 2027 1st projects to slot 1 of 3, Early.
+    assert picks.projected_tier(conn, 2026, 1, picks.Pick(2027, 1)) == picks.Pick(2027, 1, "Early", 1)
+    # A later draft can't be slotted, and a tier the user gave is kept.
+    assert picks.projected_tier(conn, 2026, 1, picks.Pick(2028, 1)) == picks.Pick(2028, 1)
+    assert picks.projected_tier(conn, 2026, 1, picks.Pick(2027, 1, "Late")) == picks.Pick(2027, 1, "Late")
+
+
+def test_holding_two_picks_in_a_round_leaves_the_tier_unknown(conn, monkeypatch):
+    monkeypatch.setattr(valuation, "contend_or_rebuild", lambda conn, s, rid: {"league_win_now_totals": {1: 50.0, 2: 150.0, 3: 100.0}})
+    conn.execute(
+        "INSERT INTO traded_picks (league_id, season, round, roster_id, previous_owner_id, owner_id, fetched_at) "
+        "VALUES ('L1', '2027', 1, 2, 2, 1, 't')"
+    )
+    assert picks.projected_tier(conn, 2026, 1, picks.Pick(2027, 1)) == picks.Pick(2027, 1)  # which one? unknown
+
+
+def test_trade_and_pick_report_price_a_tiered_pick_the_same(conn, monkeypatch):
+    values = [
+        {"player": {"position": "PICK", "name": "2027 1st"}, "value": 2834},
+        {"player": {"position": "PICK", "name": "2027 1st (Early)"}, "value": 4608},
+        {"player": {"position": "PICK", "name": "2028 1st"}, "value": 2048},
+    ]
+    monkeypatch.setattr(market, "fetch_values", lambda conn: values)
+    est = valuation.pick_value_estimate(conn, 2027, 1, 0.2, "Early")
+    assert est["market_value"] == est["model_value"] == market.pick_market_value(conn, 2027, 1, "Early") == 4608
+    assert est["price_label"] == "2027 1st (Early)"
+    untiered = valuation.pick_value_estimate(conn, 2027, 1, 0.2)
+    assert (untiered["market_value"], untiered["price_label"]) == (2834, "2027 1st")
+    later = valuation.pick_value_estimate(conn, 2028, 1, 0.2, "Early")  # no tiers that far out
+    assert later["price_label"] == "2028 1st"
+
+
+def test_the_cli_trade_default_discount_is_the_one_in_picks(monkeypatch):
+    from dynasty_agent import cli
+
+    seen = {}
+    monkeypatch.setattr(cli, "cmd_trade", lambda args: seen.update(rate=args.discount_rate))
+    monkeypatch.setattr("sys.argv", ["dynasty-agent", "trade"])
+    cli.main()
+    assert seen["rate"] == picks.DISCOUNT_RATE == picks.valuation_discount_rate()
+
+
+# -- the pick report's cost and the league's shape ------------------------------------
+
+
+def test_league_shape_reads_settings_then_counts_rosters(conn):
+    assert picks.league_shape(conn) == (3, 2)  # the fixture's num_teams and draft_rounds
+    conn.execute("UPDATE league SET settings_json = '{}'")
+    assert picks.league_shape(conn) == (3, 3)  # 3 rosters in the table; rounds default to 3
+
+
+def test_pick_report_builds_the_draft_board_once(conn, monkeypatch):
+    calls = []
+    monkeypatch.setattr(valuation, "contend_or_rebuild", lambda conn, s, rid: {"league_win_now_totals": {1: 50.0, 2: 150.0, 3: 100.0}})
+    monkeypatch.setattr(picks, "slot_history", lambda *a: {})
+    monkeypatch.setattr(market, "fetch_values", lambda conn: [])
+    monkeypatch.setattr(picks.prospect_model, "post_draft_board", lambda conn, cls: calls.append(cls) or {"rows": []})
+    report = picks.pick_report(conn, 2026, 1, 2025, {}, None)
+    assert calls == [2026]  # one board for the whole report; it was one per next-draft pick
+    assert len([r for r in report["rows"] if r["season"] == 2027]) == 6
+
+
+def test_fantasycalc_response_is_parsed_once_until_it_is_refetched(conn, monkeypatch):
+    import json as json_module
+    from datetime import datetime, timezone
+
+    key = "fantasycalc:values/current:" + json_module.dumps(market.FANTASYCALC_PARAMS, sort_keys=True)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("INSERT INTO api_cache (cache_key, response_json, fetched_at) VALUES (?, '[{\"v\": 1}]', ?)", (key, now))
+    market._parsed.clear()
+    first = market.fetch_values(conn)
+    assert market.fetch_values(conn) is first  # same parsed list, no second json.loads
+    later = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE api_cache SET response_json = '[{\"v\": 2}]', fetched_at = ? WHERE cache_key = ?", (later, key))
+    assert market.fetch_values(conn) == [{"v": 2}]  # a refetch is seen at once
