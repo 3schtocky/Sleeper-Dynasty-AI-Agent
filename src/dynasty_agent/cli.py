@@ -695,12 +695,9 @@ def cmd_optimize_lineup(args: argparse.Namespace) -> None:
     context.require_config()
     conn = get_db()
     me = context.my_roster_id(conn)
-
     stats_season = context.stats_season(conn, args.season)
     vegas_season = context.vegas_season(conn, args.vegas_season)
-
-    with SleeperClient(conn) as client:
-        client.sync_matchups(args.week)
+    sync_note = weekly.sync_matchups_or_note(conn, args.week)
 
     try:
         result = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, me)
@@ -708,11 +705,12 @@ def cmd_optimize_lineup(args: argparse.Namespace) -> None:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
-    if result["unsupported_slots"]:
-        print(
-            f"Warning: this league's roster has starting slot types this optimizer doesn't handle yet: "
-            f"{result['unsupported_slots']}. Those slots were left unfilled.\n"
-        )
+    if sync_note:
+        print(f"Note: {sync_note}\n")
+    for line in _lineup_warnings(result):
+        print(f"Warning: {line}")
+    if result["unsupported_slots"] or result["empty_slots"]:
+        print()
 
     print(f"Lineup optimizer, {stats_season} season FPPG basis, week {args.week} of the {vegas_season} season.")
     print("Picks by win probability against your real Sleeper opponent, not raw projected points.\n")
@@ -720,8 +718,9 @@ def cmd_optimize_lineup(args: argparse.Namespace) -> None:
     if result["opponent_note"]:
         print(f"Opponent: {result['opponent_note']}\n")
     else:
+        source = "" if result["opponent_source"] == "their set lineup" else f", {result['opponent_source']}"
         print(
-            f"Opponent (roster {result['opponent_roster_id']}): projected "
+            f"Opponent (roster {result['opponent_roster_id']}{source}): projected "
             f"{result['opponent_mean']:.1f} ± {result['opponent_variance'] ** 0.5:.1f}\n"
         )
 
@@ -730,23 +729,47 @@ def cmd_optimize_lineup(args: argparse.Namespace) -> None:
         flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
         vegas_note = f", vegas x{p['vegas_multiplier']:.2f}" if p["vegas_multiplier"] != 1.0 else ""
         bye_note = "  BYE WEEK" if p["on_bye"] else ""
-        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f} var={p['variance']:>5.1f}{vegas_note}{flag}{bye_note}")
+        est = "*" if p["variance_estimated"] else ""
+        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f} var={p['variance']:>5.1f}{est}{vegas_note}{flag}{bye_note}")
 
     if result["recommended_win_probability"] is not None:
         print(f"\nWin probability: {result['recommended_win_probability']:.1%}")
     else:
-        print("\nWin probability: n/a, could not assemble a full valid lineup, check unsupported_slots above")
+        print("\nWin probability: n/a, no opponent to measure against yet; this is the most projected points.")
 
     if result["differs_from_points_max"]:
+        swaps = "; ".join(f"{s['starts']} ({s['slot']}) over {s['over']}" for s in result["swaps_from_points_max"])
         print(
-            f"\nNote: this differs from the highest-raw-points lineup ({result['points_max_total']:.1f} pts). "
-            f"The flex slot is doing real work here, trading a little mean for a better win probability "
-            f"given this specific matchup, not just stacking points."
+            f"\nNote: this differs from the highest-raw-points lineup ({result['points_max_total']:.1f} pts): {swaps}. "
+            f"That trades a little mean for a better win probability given this specific matchup, not just stacking points."
         )
 
     print("\nBench:")
     for p in sorted(result["bench"], key=lambda p: -p["mean"]):
-        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}")
+        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}{_why_zero(p)}")
+    if any(p["variance_estimated"] for p in result["recommended_lineup"]):
+        print("\n* variance estimated: too few games to measure the player's own, so the position's median weekly variance stands in.")
+
+
+def _why_zero(p: dict) -> str:
+    """Why a player projects to nothing this week, when that's the case."""
+    if p["on_bye"]:
+        return "  BYE WEEK"
+    if p["injury_status"]:
+        return f"  ({p['injury_status']})"
+    return ""
+
+
+def _lineup_warnings(result: dict) -> list[str]:
+    out = []
+    if result["unsupported_slots"]:
+        out.append(
+            f"this tool has no projections for {', '.join(result['unsupported_slots'])} (nflverse weekly stats cover "
+            f"QB/RB/WR/TE only); players there count as 0."
+        )
+    if result["empty_slots"]:
+        out.append(f"no eligible player on your roster for {', '.join(result['empty_slots'])}; that slot starts empty.")
+    return out
 
 
 def cmd_faab(args: argparse.Namespace) -> None:
@@ -790,10 +813,11 @@ def cmd_digest(args: argparse.Namespace) -> None:
     stats_season = context.stats_season(conn, args.season)
     vegas_season = context.vegas_season(conn, args.vegas_season)
 
-    with SleeperClient(conn) as client:
-        client.sync_matchups(args.week)
+    sync_note = weekly.sync_matchups_or_note(conn, args.week)
 
     print(f"=== Week {args.week} digest, {stats_season} season FPPG basis, {vegas_season} season Vegas lines ===\n")
+    if sync_note:
+        print(f"Note: {sync_note}\n")
 
     try:
         lineup = weekly.optimize_lineup(conn, stats_season, vegas_season, args.week, me)
@@ -801,6 +825,8 @@ def cmd_digest(args: argparse.Namespace) -> None:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
+    for line in _lineup_warnings(lineup):
+        print(f"Warning: {line}")
     print("Start:")
     for p in lineup["recommended_lineup"]:
         flag = f"  ({p['injury_status']})" if p["injury_status"] else ""
@@ -814,12 +840,14 @@ def cmd_digest(args: argparse.Namespace) -> None:
 
     if lineup["recommended_win_probability"] is not None:
         print(f"\nWin probability: {lineup['recommended_win_probability']:.1%}")
+    else:
+        print(f"\nWin probability: n/a, {lineup['opponent_note']}.")
     if lineup["differs_from_points_max"]:
         print("Chosen over the pure-points lineup for a better win probability against this week's specific opponent.")
 
     print("\nSit (top bench by projection):")
     for p in sorted(lineup["bench"], key=lambda p: -p["mean"])[:5]:
-        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}")
+        print(f"  {p['full_name']:<20} {p['position']:<3} mean={p['mean']:>5.1f}{_why_zero(p)}")
 
     try:
         targets = weekly.top_faab_targets(conn, stats_season, me)

@@ -99,6 +99,34 @@ def team_week_implied_points(season: int, week: int) -> dict[str, float]:
     return implied
 
 
+def teams_playing(season: int, week: int) -> set[str]:
+    """Every team (nflverse codes) with a game scheduled that week, lines or
+    not. Byes come from this, not from which teams have a Vegas line: a line
+    taken off the board (a QB injury, say) or not yet posted doesn't mean a
+    bye. Empty if the schedule for that season isn't published."""
+    games_path = str(nflverse.ensure_games_cached())
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            "SELECT away_team, home_team FROM read_parquet(?) WHERE season = ? AND week = ?",
+            [games_path, season, week],
+        ).fetchall()
+    finally:
+        con.close()
+    return {team for game in rows for team in game if team}
+
+
+def is_on_bye(team: str | None, playing: set[str], week_implied: dict[str, float]) -> bool:
+    """A team is on bye when the schedule has it not playing; with no
+    schedule for the week at all, fall back to having no Vegas line when
+    other teams do. Takes nflverse team codes."""
+    if team is None:
+        return False
+    if playing:
+        return team not in playing
+    return bool(week_implied) and team not in week_implied
+
+
 def team_season_avg_implied_points(season: int, before_week: int) -> dict[str, float]:
     """Each team's average Vegas-implied points across their own completed
     games so far this season, weeks strictly before before_week only, so
@@ -131,7 +159,7 @@ def _value_matchup_side(
     names: list[str],
     week_implied: dict[str, float],
     season_avg_implied: dict[str, float],
-    week_has_data: bool,
+    playing: set[str],
 ) -> dict:
     players = []
     mean_total = 0.0
@@ -155,7 +183,7 @@ def _value_matchup_side(
         # player's own displayed team stays whatever Sleeper calls it.
         team = p["team"]
         nflverse_team = to_nflverse_team(team)
-        on_bye = week_has_data and nflverse_team is not None and nflverse_team not in week_implied
+        on_bye = is_on_bye(nflverse_team, playing, week_implied)
         if on_bye:
             vegas_mult = 0.0
             final_mean = 0.0
@@ -210,9 +238,10 @@ def predict_matchup(
     week_implied = team_week_implied_points(vegas_season, week)
     season_avg_implied = team_season_avg_implied_points(vegas_season, week)
     week_has_data = bool(week_implied)
+    playing = teams_playing(vegas_season, week)
 
-    a = _value_matchup_side(conn, season, team_a, week_implied, season_avg_implied, week_has_data)
-    b = _value_matchup_side(conn, season, team_b, week_implied, season_avg_implied, week_has_data)
+    a = _value_matchup_side(conn, season, team_a, week_implied, season_avg_implied, playing)
+    b = _value_matchup_side(conn, season, team_b, week_implied, season_avg_implied, playing)
 
     mean_diff = a["mean"] - b["mean"]
     std_diff = (a["variance"] + b["variance"]) ** 0.5

@@ -224,6 +224,7 @@ def test_retired_and_teamless_players_are_not_faab_targets(conn):
 def test_optimize_lineup_fills_every_slot_with_the_best_eligible_players(conn, monkeypatch):
     monkeypatch.setattr(weekly, "team_week_implied_points", lambda season, week: {})
     monkeypatch.setattr(weekly, "team_season_avg_implied_points", lambda season, week: {})
+    monkeypatch.setattr(weekly, "teams_playing", lambda season, week: set())
     add_league(conn)
     add_roster(conn, 1)
     add_player(conn, "qb", "QB", 20.0, roster_id=1)
@@ -238,6 +239,7 @@ def test_optimize_lineup_fills_every_slot_with_the_best_eligible_players(conn, m
     chosen = {p["player_id"] for p in result["recommended_lineup"]}
     assert chosen == {"qb", "rb0", "rb1", "wr0", "wr1", "wr2", "te", "wr3"}  # wr3 (9.0) beats rb2 (4.0) at FLEX
     assert result["opponent_note"] == "no matchup set for this week yet"
+    assert result["recommended_win_probability"] is None  # no opponent: no probability, not ~100%
 
 
 # -- weather ----------------------------------------------------------------------

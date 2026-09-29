@@ -331,12 +331,18 @@ def normalize_name(name: str) -> str:
     return " ".join(t for t in cleaned.split() if t not in _NAME_SUFFIXES)
 
 
+def slot_positions(slot: str) -> set[str]:
+    """The players.position values a Sleeper starting slot takes: a flex or
+    IDP group's members, else the slot's own position (QB, K, DEF...)."""
+    return set(_SLOT_POSITIONS.get(slot, {slot}))
+
+
 def _league_positions(conn: sqlite3.Connection) -> set[str]:
     row = conn.execute("SELECT roster_positions_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
     slots = json.loads(row["roster_positions_json"]) if row and row["roster_positions_json"] else ["QB", "RB", "WR", "TE"]
     positions: set[str] = set()
     for slot in slots:
-        positions |= _SLOT_POSITIONS.get(slot, {slot})
+        positions |= slot_positions(slot)
     return positions
 
 
