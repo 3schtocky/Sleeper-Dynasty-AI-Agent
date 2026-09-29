@@ -165,7 +165,8 @@ Each answer's numbers must match the matching CLI command's output exactly:
 4. "Who should I pick up?" should match `digest`'s FAAB targets.
 5. "Should I sell my first?" should match `picks`.
 6. "Anyone I should put on taxi?" should match `taxi`.
-7. "Trade Justin Jefferson for Puka Nacua?" should ask which Justin Jefferson.
+7. "Trade Kenneth Walker for Puka Nacua?" should ask which Kenneth Walker. (Changed 2026-09-29: "Justin
+   Jefferson" now resolves to the Vikings WR on its own, since the other is an LB this league can't start.)
 8. "What's the capital of France?" should get a short reply with no tool and no invented stats.
 
 Also: tok/s is shown under each answer, and after a cold start the first answer shows "loading

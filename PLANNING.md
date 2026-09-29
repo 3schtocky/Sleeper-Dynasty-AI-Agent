@@ -140,7 +140,7 @@ A ranked prospect board for the next rookie draft, with a recommendation on any 
 
 **Phase 4 status: done**, pending the user's approval per the phase rule. Later, not scoped: the labeled mock-draft consensus sentiment layer.
 
-## Phase 5: talk to the agent (planned, not started)
+## Phase 5: talk to the agent (preview built on branch `phase5-chat-preview`, 2026-09-29)
 
 Goal: ask "should I trade Coleman and a 2028 2nd for a 2027 1st?" or "who do I start this week?" in plain English, answered by an open-source model running locally on the MacBook Air M4 (16GB), instead of typing `uv run` commands.
 
@@ -197,14 +197,52 @@ While talking to the agent, the user sees the model working, the way LM Studio a
 - **How**: a terminal can't pin text to a corner with plain printing, it needs a small input layer that owns the bottom line. `prompt_toolkit` (the library behind IPython's prompt) does exactly this with its bottom toolbar, and also gives the chat input history and arrow-key editing. It would be this project's first UI dependency; CLAUDE.md says no framework unless asked, so confirm with the user when step 4 starts. Fallback with no new dependency: a right-aligned stats line printed under each answer, not pinned.
 - **Test**: the stats formatter is a pure function (numbers in, status string out), unit tested; the live figure checked against `ollama run --verbose` on the same prompt.
 
-### Build order
-1. [ ] Refactor: move printing out of `cli.py` into formatters, extract `digest` assembly into `weekly.py`, so the CLI and chat share one path returning plain dicts.
-2. [ ] `llm.py`: a minimal Ollama client (`POST /api/chat` with tools), model and URL from `.env`.
-3. [ ] `tools.py`: tool schemas and dispatch; every result carries its inputs and data basis.
-4. [ ] `dynasty-agent chat`: `refresh` first (the working rule), then a conversation loop with the bottom-right live stats bar above (model, tok/s, first-words time, tool used); `/raw` prints the underlying numbers, `/stats off` hides the bar.
-5. [ ] Grounding check: every number in an answer must appear in that turn's tool output, else the raw output is shown instead; draft-model caveats carried through.
-6. [ ] Evaluation set: ~40 real questions with the expected tool and arguments, offline routing tests plus a live `chat-eval`; a bake-off of 2-3 ~4B models, picked by result.
-7. [ ] Docs: this file's "No GPU work and no local models" rule changes deliberately, with the reason recorded; Ollama install steps in README and WINDOWS.md.
+### Step A: audit of everything the chat touches (2026-09-29)
+Before building the chat, the user asked for an audit of the code and models it would talk to. Two read-only scans mapped the six tool paths on main and the unmerged `worktree-phase4-college-data` branch. The user chose to fix every finding. Each fix has tests; commits A1 through A12.
+
+Real problems found and fixed:
+- **A chat session could be ended by a missing sync.** The CLI helpers raised `SystemExit`. They moved to `context.py` and raise `AgentError`; the CLI still exits 1, the chat shows the message and carries on. `DRAFT_ID` was required yet read by nothing, and `init` writes it empty for a league with no rookie draft yet, which locked such a league out of every command.
+- **Names.** `resolve_player` only reported ambiguity inside an error string, treated `%` and `_` as wildcards, and found nothing for "Marvin Harrison Jr." (Sleeper drops suffixes). It now normalizes punctuation and suffixes, returns candidates as data, drops only players at a position the league can't start (the Browns LB named Justin Jefferson, in a league with no IDP) and asks about anything else. A code review caught a first version that also preferred players with an NFL team, which could silently pick the wrong player over a free agent who signed since the last sync.
+- **Picks.** The parser took "2027-9" and rejected "2027 1st". `picks.parse_pick` reads the common spellings, "next year's 1st", tiers and slots, checked against the league's rounds, teams and tradable drafts. The trade tool priced every 2027 1st at FantasyCalc's untiered 2834 while `picks` priced the same pick at its tier (1.05 Mid, 3034); both now use `market.pick_price`, and the user's own next-draft pick is priced at its projected tier.
+- **Trades** say what can't be right: a sent player not on the user's roster, a received player who is, a free agent, a player on both sides, a pick not held. The consolidation note reads the league's bench and starter counts, and results label their units.
+- **Lineups.** An opponent with no lineup set scored 0, giving a ~100% win probability; they're now projected from their best roster lineup. Byes came from which teams had a Vegas line, so a line taken off the board zeroed a playing team and with no lines yet (week 5 today) nobody was on bye; byes come from the schedule. A rookie before game two counted as zero variance, which read as risk-free; the position's median stands in. Any slot type works, and slots the roster can't fill start empty instead of producing no lineup.
+- **Waivers.** The week 4 digest listed four QBs and a TE, every one bid at $27: raw value ranked a backup QB in a 1QB league at the top, and percentile scaling saturates at the top of a thin wire. Targets rank by lineup gain (how much each raises the user's best lineup) and bids scale by it; pacing knows the playoffs and the end of the season.
+- **Verdict** percentiles counted the user's own team (the best roster capped at the 96th percentile); now against the other 11. **Taxi** ignored its deadline and could name an injured starter as a cut. The **pick report** rebuilt the draft board per pick (`picks --all` 1.48 s to 0.52 s). Valuations are reused while the database is unchanged (six tools back to back: 855 ms to 477 ms cold, 130 ms warm).
+- From the old branch, only the Platt calibration math and its tests are ported (A11), used by nothing yet.
+
+Intended changes to CLI output, everything else byte-identical before and after:
+- `trade`: a received next-draft pick with no tier says so; the user's own next-draft pick shows its projected slot and tier price.
+- `trade`: WARNING lines for impossible trades.
+- `optimize-lineup`, `digest`: bench lines say BYE WEEK or the injury status when a player projects to 0; byes from the schedule.
+- `valuate`: 38th percentile of 12 teams became 36th against the other 11; the verdict is unchanged.
+- `digest`, `faab`: targets by lineup gain (week 4: Trey Benson +3.0 $27, Jake Tonges +1.8 $17, Deshaun Watson depth only $2).
+- `taxi`: the next-season line names who graduates from taxi.
+
+### Preview build (steps 1-7, 2026-09-29)
+1. [x] `formatters.py`: one text function per result, used by the CLI and the chat. Output byte-identical on the seven snapshot commands and three extra variants, each diffed against the commit before.
+2. [x] `llm.py`: an Ollama client over `httpx`, no new dependency. Live: warm 2.1 s, routing 1.8 s, 35.8 tok/s writing, first words 0.10 s.
+3. [x] `tools.py`: six tools (`set_lineup`, `evaluate_trade`, `my_team`, `waiver_targets` with an optional player or position, `pick_advice`, `taxi_plan`), none asking for week, season or roster. Lenient arguments; an ambiguous or unknown name or an impossible pick comes back as a question.
+4. [x] `dynasty-agent chat`: refresh while the model loads, route, the numbers block, a streamed take, a stats line (model, exact tok/s, first-words time or "loading model...", tool). The pinned bottom-right bar waits on the user's go-ahead for `prompt_toolkit`; the preview prints the line under each answer.
+5. [x] Grounding: the take is released a sentence at a time and a sentence quoting a number not in that turn's numbers block, summary or question is never shown.
+6. [x] Model audit: `chat_eval.py`, 39 questions on the real tools, trades scored on direction; `dynasty-agent chat-eval` runs it live and `--record` feeds the offline replay test.
+7. [x] Docs, this entry, and CLAUDE.md's local-model rule.
+
+Found live and fixed while building, each one a real behavior the model showed:
+- Earlier answers in the router's context made it imitate them ("(showed the my_team result)") instead of calling tools. Each question is now routed on its own, the way the bake-off scored 16/16; only a clarifying exchange carries forward, so "the RB" can answer "Which Kenneth Walker?".
+- Takes quoted JSON field names and rounded 16.5 to 16 (the grounding check dropped them). The prompt now asks for numbers copied character for character and a headline-first answer, and each summary carries a plain headline.
+- The model added a WR filter nobody asked for, and filled an optional argument with "none".
+- **Trade reversals, the worst failure.** The first live `chat-eval` scored 36/39, with two reversals: "a guy offered me his 2028 1st for Rome Odunze" and "my 2027 round 1 pick for Trey Benson". Fixed in Python rather than by trusting the model: `tools.fix_sides` moves a player the rosters prove is on the wrong side (a "received" player the user owns, a "sent" player another team owns), then the picks if one side is left empty, and says so in the output. Free agents and ambiguous names are never moved. A first version swapped whole trades, which would have sent the user's 2028 1st too when the model put both assets on one side.
+
+Verified live on the real league (week 4, 2026):
+- Acceptance: "Who should I start this week?", "Should I trade Jonah Coleman and my 2028 2nd for a 2027 1st?" (net -221, the CLI's number), "Am I a contender?", "Who should I pick up?", "Should I sell my first?", "Anyone I should put on taxi?" each answer from the matching command's own numbers. "Trade Kenneth Walker for Puka Nacua?" asks which Kenneth Walker (acceptance item 7 changed: "Justin Jefferson" now resolves to the Vikings WR, correctly, since the other is an LB the league can't start). "What's the capital of France?" gets a short reply, no tool, no numbers.
+- `chat-eval`: 39/39 after the fixes, 1-2 s per route. Writing speed 27-33 tok/s in session, first words 0.5-1.8 s.
+
+After the preview (recorded, not built):
+- The pinned bottom-right stats bar (`prompt_toolkit`, first UI dependency: needs the user's go-ahead).
+- Port `simulate.py` from the old branch as a seventh tool ("what are my playoff odds?").
+- Re-derive calibration on this branch's blended projections before any win probability drops its draft label.
+- A one-line installer rewritten for Ollama (the old branch's LM Studio script has a `curl | bash` stdin bug, no `pipefail` and a PATH gap).
+- The first-run setup wizard, shaped by the user's clean-install test.
 
 ### Stated limits
 - Sleeper's API is read-only: the agent recommends a lineup, bid, trade, or taxi move; the user makes it in the Sleeper app.

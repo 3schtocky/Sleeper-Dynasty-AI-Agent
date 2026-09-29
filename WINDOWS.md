@@ -115,6 +115,17 @@ uv run dynasty-agent predict-matchup --week 1 `
 
 Everything reruns fresh against whatever's cached in the `data\` folder (git-ignored, local SQLite plus downloaded nflverse files). Nothing here needs a server or an account beyond your own Sleeper login. What each command actually does, and how the underlying math works, is documented once in the main [`README.md`](README.md), not repeated here, it applies exactly as written regardless of OS.
 
+## 6. Optional: talk to the agent (preview)
+
+Install Ollama from [ollama.com/download](https://ollama.com/download) (the Windows installer), open it, then in PowerShell:
+
+```powershell
+ollama pull qwen3:4b-instruct
+uv run dynasty-agent chat
+```
+
+Everything else about `chat` is the same as on macOS; see "Talk to the agent" in `README.md`. To watch requests arrive, Ollama's log is at `$env:LOCALAPPDATA\Ollama\server.log`.
+
 ## Troubleshooting
 
 **"running scripts is disabled on this system"** when running the `uv` installer, or anything else PowerShell-script-based. The installer command above already includes `-ExecutionPolicy ByPass` for itself, so this shouldn't hit you there, however if you see it elsewhere, PowerShell's default execution policy blocks unsigned scripts. Check your current policy and loosen it for your own account only (safer than a machine-wide change):
