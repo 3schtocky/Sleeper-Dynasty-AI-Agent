@@ -525,6 +525,8 @@ def evaluate_trade(
     player_three_year_delta = received["player_three_year_total"] - sent["player_three_year_total"]
     market_value_delta = received["market_value_total"] - sent["market_value_total"]
 
+    warnings = _trade_warnings(conn, my_roster_id, send_resolved, send_picks, receive_resolved, picks_module)
+
     verdict = contend_or_rebuild(conn, valuation_season, my_roster_id)
     posture = verdict["verdict"]
     if posture == "contend":
@@ -536,7 +538,11 @@ def evaluate_trade(
 
     consolidation = None
     if sent["asset_count"] >= 2 and received["asset_count"] == 1:
-        consolidation = "consolidation: multiple pieces for one. Generally favors you, 10 bench slots against only 8 starters."
+        starters, bench = _starter_and_bench_counts(conn)
+        consolidation = (
+            f"consolidation: multiple pieces for one. Generally favors you, {bench} bench slots against only "
+            f"{starters} starters."
+        )
     elif received["asset_count"] >= 2 and sent["asset_count"] == 1:
         consolidation = "deconsolidation: one piece for multiple. Generally works against you unless every piece coming back is startable."
 
@@ -551,4 +557,73 @@ def evaluate_trade(
         "fit": fit,
         "consolidation": consolidation,
         "discount_rate": discount_rate,
+        "warnings": warnings,
+        "units": dict(TRADE_UNITS),
     }
+
+
+# What each number in a trade evaluation is measured in. Two scales, never
+# added together: see _value_trade_side.
+TRADE_UNITS = {
+    "win_now_value": "this league's points-per-game scale",
+    "three_year_value": "this league's points-per-game scale",
+    "market_value": "FantasyCalc trade-value points, not dollars",
+    "model_value": "FantasyCalc trade-value points, not dollars",
+}
+
+
+def _starter_and_bench_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    row = conn.execute("SELECT roster_positions_json FROM league ORDER BY fetched_at DESC LIMIT 1").fetchone()
+    slots = json.loads(row["roster_positions_json"]) if row else []
+    return sum(starting_slot_counts(slots).values()), slots.count("BN")
+
+
+def _trade_warnings(conn: sqlite3.Connection, my_roster_id: int, sent: list[dict], send_picks: list,
+                    received: list[dict], picks_module) -> list[str]:
+    """Things about the trade as entered that can't be right, said plainly
+    and not treated as errors, so a hypothetical still gets valued: a sent
+    player who isn't mine, a received one who is (or is on no roster), a
+    player on both sides, or a pick I don't hold."""
+    from dynasty_agent.context import team_names
+
+    names = team_names(conn)
+    owner = {r["player_id"]: r["roster_id"] for r in conn.execute("SELECT player_id, roster_id FROM roster_players")}
+    warnings = []
+
+    def where(pid: str) -> str:
+        return f"on {names.get(owner[pid], 'another team')}" if pid in owner else "a free agent"
+
+    for p in sent:
+        if owner.get(p["player_id"]) != my_roster_id:
+            warnings.append(f"You'd send {p['full_name']}, who isn't on your roster ({where(p['player_id'])}).")
+    for p in received:
+        if owner.get(p["player_id"]) == my_roster_id:
+            warnings.append(f"You'd receive {p['full_name']}, who is already on your roster.")
+        elif p["player_id"] not in owner:
+            warnings.append(f"You'd receive {p['full_name']}, a free agent: no trade needed, put in a waiver bid instead.")
+    for side, label in ((sent, "send"), (received, "receive")):
+        ids = [p["player_id"] for p in side]
+        for pid in sorted({i for i in ids if ids.count(i) > 1}):
+            warnings.append(f"{next(p['full_name'] for p in side if p['player_id'] == pid)} is listed twice on the {label} side.")
+    for pid in sorted({p["player_id"] for p in sent} & {p["player_id"] for p in received}):
+        warnings.append(f"{next(p['full_name'] for p in sent if p['player_id'] == pid)} is on both sides of the trade.")
+
+    try:
+        inventory = picks_module.inventory(conn)
+    except ValueError:
+        return warnings  # no league synced; the picks can't be checked
+    wanted: dict[tuple[int, int], int] = {}
+    for pick in send_picks:
+        key = (pick[0], pick[1])
+        wanted[key] = wanted.get(key, 0) + 1
+    for (season, rnd), count in sorted(wanted.items()):
+        held = [p for p in inventory if (p["season"], p["round"]) == (season, rnd) and p["owner_roster_id"] == my_roster_id]
+        if len(held) >= count:
+            continue
+        label = f"{season} {market.round_label(rnd)}"
+        own = next((p for p in inventory if (p["season"], p["round"], p["original_roster_id"]) == (season, rnd, my_roster_id)), None)
+        if not held and own is not None:
+            warnings.append(f"You'd send a {label}, but you traded yours to {names.get(own['owner_roster_id'], 'another team')}.")
+        else:
+            warnings.append(f"You'd send {count} {label} pick(s), but you hold {len(held)}.")
+    return warnings

@@ -124,6 +124,68 @@ def test_trade_side_names_unpriced_assets_instead_of_a_silent_zero(conn, monkeyp
     assert side["unpriced"] == ["Player p1", "2027 round 1"]
 
 
+def trade_league(conn, monkeypatch):
+    """Two rosters, a player each plus a free agent, and FantasyCalc pick prices."""
+    monkeypatch.setattr(market, "fetch_values", lambda conn: fake_pick_values({"2027 1st": 2800, "2028 1st": 2000}))
+    add_league(conn)
+    conn.execute("UPDATE league SET settings_json = ?", (json.dumps({"playoff_week_start": 15, "draft_rounds": 3}),))
+    add_roster(conn, 1)
+    add_roster(conn, 2)
+    add_player(conn, "mine", "WR", 12.0, roster_id=1)
+    add_player(conn, "theirs", "RB", 10.0, roster_id=2)
+    add_player(conn, "fa", "TE", 6.0)
+
+
+def trade(conn, send=(), send_picks=(), receive=(), receive_picks=()):
+    return valuation.evaluate_trade(conn, 2025, 1, list(send), list(send_picks), list(receive), list(receive_picks), 0.2)
+
+
+def test_a_clean_trade_has_no_warnings(conn, monkeypatch):
+    trade_league(conn, monkeypatch)
+    result = trade(conn, send=["mine"], send_picks=[(2027, 1)], receive=["theirs"])
+    assert result["warnings"] == []
+
+
+def test_trade_warns_about_players_on_the_wrong_side(conn, monkeypatch):
+    trade_league(conn, monkeypatch)
+    w = trade(conn, send=["theirs"], receive=["mine", "fa"])["warnings"]
+    assert "You'd send Player theirs, who isn't on your roster (on roster 2)." in w
+    assert "You'd receive Player mine, who is already on your roster." in w
+    assert any("Player fa, a free agent" in x for x in w)
+
+
+def test_trade_warns_about_a_player_on_both_sides_or_listed_twice(conn, monkeypatch):
+    trade_league(conn, monkeypatch)
+    w = trade(conn, send=["mine", "mine"], receive=["mine"])["warnings"]
+    assert "Player mine is listed twice on the send side." in w
+    assert "Player mine is on both sides of the trade." in w
+
+
+def test_trade_warns_about_a_pick_you_dont_hold(conn, monkeypatch):
+    trade_league(conn, monkeypatch)
+    conn.execute(
+        "INSERT INTO traded_picks (league_id, season, round, roster_id, previous_owner_id, owner_id, fetched_at) "
+        "VALUES ('L1', '2027', 1, 1, 1, 2, 't')"
+    )
+    assert trade(conn, send_picks=[(2027, 1)])["warnings"] == ["You'd send a 2027 1st, but you traded yours to roster 2."]
+    assert trade(conn, send_picks=[(2028, 1), (2028, 1)])["warnings"] == ["You'd send 2 2028 1st pick(s), but you hold 1."]
+
+
+def test_consolidation_note_reads_the_leagues_roster_shape(conn, monkeypatch):
+    trade_league(conn, monkeypatch)
+    result = trade(conn, send=["mine"], send_picks=[(2028, 1)], receive=["theirs"])
+    assert "10 bench slots against only 8 starters" in result["consolidation"]
+    conn.execute("UPDATE league SET roster_positions_json = ?", (json.dumps(["QB", "RB", "WR", "FLEX"] + ["BN"] * 6),))
+    result = trade(conn, send=["mine"], send_picks=[(2028, 1)], receive=["theirs"])
+    assert "6 bench slots against only 4 starters" in result["consolidation"]
+
+
+def test_trade_result_labels_its_units(conn, monkeypatch):
+    trade_league(conn, monkeypatch)
+    units = trade(conn, send=["mine"])["units"]
+    assert "not dollars" in units["market_value"] and "points-per-game" in units["win_now_value"]
+
+
 # -- FAAB -------------------------------------------------------------------------
 
 

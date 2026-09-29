@@ -84,3 +84,13 @@ def scoring_settings(conn: sqlite3.Connection) -> dict:
     if row is None:
         raise AgentError(f"No league data cached yet. {_REFRESH_FIRST}")
     return json.loads(row["scoring_settings_json"])
+
+
+def team_names(conn: sqlite3.Connection) -> dict[int, str]:
+    """{roster_id: the manager's team name, else display name, else "roster N"}."""
+    return {
+        r["roster_id"]: (r["team_name"] or r["display_name"] or f"roster {r['roster_id']}")
+        for r in conn.execute(
+            "SELECT ro.roster_id, u.display_name, u.team_name FROM rosters ro LEFT JOIN users u ON u.user_id = ro.owner_id"
+        )
+    }

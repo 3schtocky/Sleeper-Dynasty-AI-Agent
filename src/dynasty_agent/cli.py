@@ -319,12 +319,7 @@ def cmd_picks(args: argparse.Namespace) -> None:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
 
-    names = {
-        r["roster_id"]: (r["team_name"] or r["display_name"] or f"roster {r['roster_id']}")
-        for r in conn.execute(
-            "SELECT ro.roster_id, u.display_name, u.team_name FROM rosters ro LEFT JOIN users u ON u.user_id = ro.owner_id"
-        )
-    }
+    names = context.team_names(conn)
     weight = report["record_weight"]
     print(f"Rookie picks, {'every team' if args.all else 'yours'}. Next draft: {report['next_draft']}.")
     print(
@@ -623,6 +618,10 @@ def cmd_trade(args: argparse.Namespace) -> None:
         "my discount-adjusted pick model, the only number below that's comparable across players and picks "
         "together.\n"
     )
+    for warning in result["warnings"]:
+        print(f"WARNING: {warning}")
+    if result["warnings"]:
+        print()
     print_side("You send", result["sent"])
     print()
     print_side("You receive", result["received"])
