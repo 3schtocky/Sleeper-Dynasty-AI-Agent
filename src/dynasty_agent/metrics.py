@@ -459,3 +459,103 @@ def blended_variance(prior_values: list[float], prior_weight_games: float, curre
         return None
     mean = sum(w * x for x, w in weighted) / v1
     return sum(w * (x - mean) ** 2 for x, w in weighted) / (v1 - v2 / v1)
+
+
+# -- Matchup-model calibration math ---------------------------------------------
+#
+# Ported unchanged from the unmerged worktree-phase4-college-data branch
+# (commit e8fb28c), math and tests only. Nothing calls it yet: that branch's
+# backtest fitted it on whole NFL teams' real games, which may not transfer
+# to 8-starter fantasy lineups, and its backtest code doesn't run against
+# this branch's blended projections. Re-deriving the fit is recorded as
+# follow-up work in PLANNING.md; until then every win probability stays
+# labeled a draft heuristic.
+#
+# Platt scaling: a real, standard technique for recalibrating a heuristic's
+# probability estimates against real outcomes without changing the
+# heuristic's ranking (a > 0 keeps it strictly monotonic in raw_prob,
+# see weekly.optimize_lineup's own comment on why that matters). Plain
+# Python throughout, no numpy/scipy/sklearn: fitting two parameters via
+# batch gradient descent over a few thousand real (probability, outcome)
+# pairs is a tiny optimization problem, nothing here needs a framework.
+
+_PROB_EPSILON = 1e-6
+
+
+def logit(p: float) -> float:
+    """Log-odds. Clamped to [1e-6, 1 - 1e-6] first, so a raw probability of
+    exactly 0.0 or 1.0 (a real, reachable case: matchup_win_probability
+    returns exactly 1.0/0.0 when either side's variance is degenerate)
+    never produces +/-inf."""
+    clamped = max(_PROB_EPSILON, min(1 - _PROB_EPSILON, p))
+    return math.log(clamped / (1 - clamped))
+
+
+def sigmoid(z: float) -> float:
+    """The inverse of logit. Guards against overflow on a very large
+    |z| (a real possibility mid gradient-descent before it converges),
+    returning the mathematically correct 0.0/1.0 limit instead of raising
+    OverflowError."""
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    ez = math.exp(z)
+    return ez / (1.0 + ez)
+
+
+def platt_scale(raw_prob: float, a: float, b: float) -> float:
+    """sigmoid(a * logit(raw_prob) + b). a=1.0, b=0.0 is the identity
+    mapping (no correction)."""
+    return sigmoid(a * logit(raw_prob) + b)
+
+
+def fit_platt_scaling(
+    pairs: list[tuple[float, float]], iterations: int = 500, learning_rate: float = 0.05
+) -> tuple[float, float]:
+    """Fits (a, b) minimizing log-loss between platt_scale(raw_prob, a, b)
+    and real outcomes, via batch gradient descent. pairs are
+    (raw_probability, actual_outcome), outcome in {0.0, 0.5, 1.0} (0.5 for
+    a real tie). Starts at (1.0, 0.0), the identity mapping, so an
+    already-reasonable heuristic converges fast rather than starting from
+    "always predict 0.5" at (0.0, 0.0). Returns (1.0, 0.0) unchanged for an
+    empty sample, never divides by zero."""
+    if not pairs:
+        return 1.0, 0.0
+
+    xs = [logit(p) for p, _ in pairs]
+    ys = [y for _, y in pairs]
+    n = len(pairs)
+
+    a, b = 1.0, 0.0
+    for _ in range(iterations):
+        grad_a, grad_b = 0.0, 0.0
+        for x, y in zip(xs, ys):
+            calibrated = sigmoid(a * x + b)
+            error = calibrated - y
+            grad_a += error * x
+            grad_b += error
+        a -= learning_rate * grad_a / n
+        b -= learning_rate * grad_b / n
+    return a, b
+
+
+def brier_score(pairs: list[tuple[float, float]]) -> float:
+    """Mean squared error between predicted probability and real outcome,
+    0 is perfect, 0.25 is what "always predict 0.5" scores. Lower is
+    better calibrated."""
+    if not pairs:
+        return 0.0
+    return sum((p - y) ** 2 for p, y in pairs) / len(pairs)
+
+
+def log_loss(pairs: list[tuple[float, float]]) -> float:
+    """Mean cross-entropy loss between predicted probability and real
+    outcome, clamped the same way logit is, so a prediction of exactly
+    0.0 or 1.0 against the wrong outcome doesn't produce +/-inf. Lower is
+    better calibrated."""
+    if not pairs:
+        return 0.0
+    total = 0.0
+    for p, y in pairs:
+        clamped = max(_PROB_EPSILON, min(1 - _PROB_EPSILON, p))
+        total += -(y * math.log(clamped) + (1 - y) * math.log(1 - clamped))
+    return total / len(pairs)
