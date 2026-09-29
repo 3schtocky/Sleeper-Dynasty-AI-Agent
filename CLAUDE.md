@@ -54,7 +54,7 @@ Work in phases. Do not skip ahead. Stop at the end of each phase, show what got 
 - **Phase 2, analysis layer. Done.** Player valuation (production score, dynasty age curve, situation score, separate win-now and three-year values), contend-or-rebuild verdict with stated confidence, and trade evaluation with pick-value discounting and consolidation flags.
 - **Phase 3, weekly workflow. Done.** Vegas implied totals, opponent strength by EPA allowed, injury checks (Sleeper's structured status), weather, a win-probability lineup optimizer, FAAB sizing, and a weekly digest command.
 - **Phase 4, rookie draft prep. Done.** College production (sportsdataverse), a player id crosswalk, a prospect model fitted to real 2018+ outcomes, `prospect-board` (post-draft and labeled-weak pre-draft), rookie values in `valuate`/`trade`, `picks` (buy/hold/sell), and `taxi`. See `PLANNING.md`.
-- **Phase 5, talk to the agent. Next.** A local open-source model (Ollama, terminal chat first) that routes a plain-English question to the existing functions and explains their numbers, never computing any itself.
+- **Phase 5, talk to the agent. Next.** A local open-source model (Ollama, terminal chat first) that routes a plain-English question to the existing functions and explains their numbers, never computing any itself, with a live tokens/second status bar in the bottom right like LM Studio and Ollama's app.
 
 ## Working rules
 

@@ -184,11 +184,24 @@ Design rules this surfaced, before any code: never ask the model for anything Py
 ### User experience target
 `git clone`, then `uv run dynasty-agent` with no arguments opens a first-run setup: checks Ollama and downloads the model (saying the size first), asks the Sleeper username and league, loads the data with progress (replacing today's five first-run commands), asks what matters to the user (contending, rebuilding, trades, waivers, rookies), offers the daily refresh, then opens the chat with a short brief tuned to those priorities. Before building it, the user will run a first-time install from GitHub by hand to find where today's onboarding breaks.
 
+### Requirement: live model stats, bottom right (requested 2026-09-29)
+While talking to the agent, the user sees the model working, the way LM Studio and Ollama's own app show it: a status bar pinned to the bottom-right of the terminal.
+
+```
+                                     qwen3:4b-instruct · 34.8 tok/s · first words 1.2s · tool: evaluate_trade
+```
+
+- **Live while it writes**: tokens per second updates as the answer streams (tokens received / seconds since the first one), then settles on Ollama's exact figure when the answer finishes (`eval_count / eval_duration`, reported with every reply, the same source `ollama run --verbose` uses).
+- **Also shown**: the model name, time to first words, which tool ran (or "no tool"), and after a reply the reading speed (`prompt_eval_count / prompt_eval_duration`). A one-time model load shows as "loading model..." instead of a misleading slow rate.
+- **On by default**; `/stats off` hides it for the session, `DYNASTY_AGENT_STATS=off` in `.env` hides it by default.
+- **How**: a terminal can't pin text to a corner with plain printing, it needs a small input layer that owns the bottom line. `prompt_toolkit` (the library behind IPython's prompt) does exactly this with its bottom toolbar, and also gives the chat input history and arrow-key editing. It would be this project's first UI dependency; CLAUDE.md says no framework unless asked, so confirm with the user when step 4 starts. Fallback with no new dependency: a right-aligned stats line printed under each answer, not pinned.
+- **Test**: the stats formatter is a pure function (numbers in, status string out), unit tested; the live figure checked against `ollama run --verbose` on the same prompt.
+
 ### Build order
 1. [ ] Refactor: move printing out of `cli.py` into formatters, extract `digest` assembly into `weekly.py`, so the CLI and chat share one path returning plain dicts.
 2. [ ] `llm.py`: a minimal Ollama client (`POST /api/chat` with tools), model and URL from `.env`.
 3. [ ] `tools.py`: tool schemas and dispatch; every result carries its inputs and data basis.
-4. [ ] `dynasty-agent chat`: `refresh` first (the working rule), then a conversation loop; shows which tool ran, `/raw` prints the underlying numbers.
+4. [ ] `dynasty-agent chat`: `refresh` first (the working rule), then a conversation loop with the bottom-right live stats bar above (model, tok/s, first-words time, tool used); `/raw` prints the underlying numbers, `/stats off` hides the bar.
 5. [ ] Grounding check: every number in an answer must appear in that turn's tool output, else the raw output is shown instead; draft-model caveats carried through.
 6. [ ] Evaluation set: ~40 real questions with the expected tool and arguments, offline routing tests plus a live `chat-eval`; a bake-off of 2-3 ~4B models, picked by result.
 7. [ ] Docs: this file's "No GPU work and no local models" rule changes deliberately, with the reason recorded; Ollama install steps in README and WINDOWS.md.
